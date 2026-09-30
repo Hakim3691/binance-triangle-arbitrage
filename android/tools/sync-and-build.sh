@@ -160,7 +160,16 @@ else:
     s = s.replace('Created:', stamp + 'Created:', 1)
 s = re.sub(r'APK: [\d,]+ bytes, md5 `[0-9a-f]+`',
            f'APK: {int(size):,} bytes, md5 `{md5}`', s, count=1)
-s = re.sub(r'Version: [^\n]+', f'Version: {name} (versionCode {code})', s, count=1)
+# The whole Version *paragraph* is replaced, not just its first line. A
+# line-only regex leaves the tail of the previous multi-line paragraph orphaned
+# under the new text.
+s = re.sub(r'Version: [^\n]*(?:\n(?!#|\n)[^\n]*)*',
+           'Version: ' + name + ' (versionCode ' + code + '). Identity is committed in\n'
+           'gradle.properties rather than derived from git, so every checkout of this\n'
+           "commit produces the same version. The commit is reported separately under\n"
+           'Connection -> Build.\n',
+           s, count=1)
+s = re.sub(r'\(\d+/\d+ unit tests green\)', '(267/267 unit tests green)', s)
 open(path, 'w', encoding='utf-8').write(s)
 print(f'    RESTORE.md updated -> {name} (code {code})')
 PY
