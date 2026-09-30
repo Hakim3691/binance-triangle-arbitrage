@@ -45,28 +45,30 @@ corresponds exactly to mirrored commit `2d4dad0` is available separately:
 | `minSdkVersion` | 26 (Android 8.0) |
 | `targetSdk` / `compileSdk` | 34 (Android 14) |
 
-`versionName` carries the git commit it was built from, so the string
-`1.0.20+2d4dad0` is a quick way to confirm the binary matches this source.
+**Version identity is committed, not derived from git.** `bta.versionCode` and
+`bta.versionName` live in `android/gradle.properties` and are bumped explicitly
+when behaviour changes. They used to be derived from `git rev-list --count` and
+`git rev-parse --short`, which meant the same source produced a different APK
+depending on which repository contained it (`1.0.20+2d4dad0`, `1.0.3+a7d3574`,
+`1.0.20+nosha`). **Every checkout of a commit now yields the same
+`versionName`**, so the table above is meaningful whichever copy you build.
 
-**Caveat for builds made from this branch.** `versionCode`/`versionName` are
-derived from git at build time in `app/build.gradle.kts`, but only when the
-project directory is itself the root of a git checkout. Here it is not - it sits
-inside the Node.js repository - so a build from this branch reports
-`1.0.20+nosha` and `versionCode=20` (the pinned fallback in
-`gradle.properties`) rather than `1.0.20+2d4dad0`. The `+nosha` suffix is
-deliberate: it means "no provenance available", not a borrowed commit id.
+The commit is still recorded, but separately, as `BuildConfig.BUILD_COMMIT`
+shown under Connection -> Build. It does not affect the version.
 
-Consequences for anyone comparing binaries:
+**What the md5 does and does not guarantee.** Verified: wiping `build/`,
+`.gradle/` and `.kotlin/` and rebuilding in the same directory reproduces a
+byte-identical APK. Building the *same commit* from the mirror instead produces
+the same `versionName` but a **different md5**, because `BUILD_COMMIT` differs
+(`unknown` vs the mirror's sha) and R8's synthetic-lambda class-name hashes
+shift with the string pool.
 
-- `versionCode`/`versionName` will **not** match the table above when rebuilt here.
-- The md5 will **not** match `e358948c6b95525c2dd6254327ce6732`, because the
-  version strings are embedded in the manifest.
-- The APK *is* otherwise equivalent - same source, same SDK, same signing scheme.
-- The build is reproducible in the sense that matters: the same commit in the
-  standalone repository always produces `1.0.20+2d4dad0` and the same md5.
+So:
+- Same directory + same commit -> identical md5. This is the guarantee.
+- Different directory, same commit -> same version, different md5.
 
-Once this lives in its own repository again, the original provenance behaviour
-returns automatically with no build-file change.
+Use `versionName` to identify *what code* is installed and the md5 to identify
+*which exact file*.
 
 To verify a download before installing:
 
@@ -88,9 +90,28 @@ Gradle and is not committed.
 
 ```sh
 cd android
-./gradlew testDebugUnitTest    # 260 unit tests
+./gradlew testDebugUnitTest    # 267 unit tests
 ./gradlew assembleDebug       # produces app/build/outputs/apk/debug/app-debug.apk
 ```
 
 Building requires a local Android SDK (`ANDROID_HOME` or `local.properties`);
 none of that is mirrored here.
+
+## Keeping the copies in sync
+
+This directory is the **source of truth**. `Hakim3691/binance-triangle-arbitrage-android`
+is a generated mirror and the offline package is a build output - neither is
+edited by hand.
+
+```sh
+tools/sync-and-build.sh
+```
+
+One command that commits-check, syncs the mirror, runs the tests, rebuilds the
+APK and republishes the offline package with `RESTORE.md` rewritten from the
+binary that was actually produced. It refuses to run on a dirty `android/` tree
+and refuses to overwrite a dirty mirror, so what lands in the mirror is exactly
+what is committed.
+
+Run it after every change. Override the targets with `BTA_MIRROR_DIR` and
+`BTA_PACKAGE_DIR`.
