@@ -28,8 +28,51 @@ The Android app is a self-contained native port and shares no runtime or build
 dependency with the original `src/`. Nothing outside `android/` was changed on
 this branch.
 
+## Prebuilt APK
+
+The installable binary is **not** committed here — `build/` is a generated
+directory and a 19 MB artifact does not belong in git history. The build that
+corresponds exactly to mirrored commit `2d4dad0` is available separately:
+
+| | |
+|---|---|
+| File | `app-debug.apk` |
+| Size | 19,142,053 bytes |
+| MD5 | `e358948c6b95525c2dd6254327ce6732` |
+| `applicationId` | `com.hakim3691.bta` |
+| `versionCode` | `20` |
+| `versionName` | `1.0.20+2d4dad0` |
+| `minSdkVersion` | 26 (Android 8.0) |
+| `targetSdk` / `compileSdk` | 34 (Android 14) |
+
+`versionName` carries the git commit it was built from, so the string
+`1.0.20+2d4dad0` is a quick way to confirm the binary matches this source. The
+`versionCode`/`versionName` pair is derived from git at build time in
+`app/build.gradle.kts`, so it is only meaningful when built from this history.
+
+To verify a download before installing:
+
+```sh
+md5sum app-debug.apk
+# expect: e358948c6b95525c2dd6254327ce6732
+```
+
+This is a **debug** build signed with the standard Android debug key. It is not
+suitable for distribution, and the debug key is machine-local — a release build
+requires a proper keystore that is deliberately not part of this repository.
+See `SECURITY.md`.
+
 ## Building
 
 See `android/README.md`, `android/ARCHITECTURE.md` and `android/TESTING.md`.
 `local.properties` (Android SDK location) is generated locally by the IDE or
 Gradle and is not committed.
+
+```sh
+cd android
+./gradlew testDebugUnitTest    # 260 unit tests
+./gradlew assembleDebug       # produces app/build/outputs/apk/debug/app-debug.apk
+```
+
+Building requires a local Android SDK (`ANDROID_HOME` or `local.properties`);
+none of that is mirrored here.
