@@ -5,6 +5,48 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
+/**
+ * True only when this Gradle root is the top level of a git repository, i.e. the
+ * checkout that actually owns these sources. False when git is missing, when the
+ * build runs from an exported source tree, or when the project merely sits inside
+ * some other repository - all cases where the surrounding repo's history says
+ * nothing about this code.
+ */
+val isOwnGitCheckout: Boolean = run {
+    val topLevel = providers.exec {
+        commandLine("git", "rev-parse", "--show-toplevel")
+        isIgnoreExitValue = true
+    }.standardOutput.asText.get().trim()
+    topLevel.isNotEmpty() && topLevel == rootDir.canonicalPath
+}
+
+val gitCommitCount: Int = if (isOwnGitCheckout) {
+    providers.exec { commandLine("git", "rev-list", "--count", "HEAD") }
+        .standardOutput.asText.get().trim().toIntOrNull() ?: 0
+} else 0
+
+val gitShortSha: String = if (isOwnGitCheckout) {
+    providers.exec { commandLine("git", "rev-parse", "--short", "HEAD") }
+        .standardOutput.asText.get().trim()
+} else ""
+
+// Pinned fallbacks, overridable with -Pbta.versionCode=42 or from gradle.properties.
+// Used when there is no git history to derive from, so a source export still gets a
+// meaningful, monotonic version instead of a fabricated one.
+val pinnedVersionCode: Int = (findProperty("bta.versionCode") as String?)?.toIntOrNull() ?: 20
+val pinnedVersionName: String = (findProperty("bta.versionName") as String?) ?: "1.0.20"
+
+val resolvedVersionCode: Int = if (gitCommitCount > 0) gitCommitCount else pinnedVersionCode
+
+val resolvedVersionName: String = when {
+    // A real checkout: version tracks its own history, so the same commit always
+    // builds to the same version and two commits are always distinguishable.
+    gitCommitCount > 0 && gitShortSha.isNotEmpty() -> "1.0.$gitCommitCount+$gitShortSha"
+    // No usable history. The suffix admits that rather than borrowing another
+    // repository's identity.
+    else -> "$pinnedVersionName+nosha"
+}
+
 android {
     namespace = "com.hakim3691.bta"
     compileSdk = 34
@@ -16,14 +58,17 @@ android {
         // Derived from git so every build is distinguishable in the launcher.
         // Seventeen APKs all reading "1.0.0" makes it impossible to tell which
         // one is installed.
-        versionCode = (providers.exec {
-            commandLine("git", "rev-list", "--count", "HEAD")
-        }.standardOutput.asText.get().trim().toIntOrNull() ?: 1).coerceAtLeast(1)
-        versionName = "1.0." + (providers.exec {
-            commandLine("git", "rev-list", "--count", "HEAD")
-        }.standardOutput.asText.get().trim()) + "+" + (providers.exec {
-            commandLine("git", "rev-parse", "--short", "HEAD")
-        }.standardOutput.asText.get().trim())
+        //
+        // The git lookup is deliberately scoped to THIS project directory. A bare
+        // `git rev-parse` walks upwards and happily reports whatever repository
+        // happens to contain the build, so building these sources from a copy
+        // parked in an unrelated repo stamped the version with that repo's
+        // history (1.0.3+a7d3574) instead of this project's. The commit suffix
+        // is only added when this directory is itself the repository root;
+        // otherwise the build falls back to the pinned bta.version.* properties
+        // in gradle.properties rather than inventing a provenance it does not have.
+        versionCode = resolvedVersionCode
+        versionName = resolvedVersionName
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

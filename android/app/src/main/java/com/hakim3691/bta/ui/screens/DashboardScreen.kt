@@ -127,19 +127,8 @@ fun DashboardScreen(viewModel: ArbViewModel, navController: NavController) {
             ) { Text("RESET EXECUTION CAP") }
         }
 
-        Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            NavChip("SETTINGS", BtaYellow, Color.Black) { navController.navigate("settings") }
-            NavChip("OPPORTUNITIES", CardBorder, MaterialTheme.colorScheme.onBackground) { navController.navigate("opportunities") }
-            NavChip("EXECUTIONS", CardBorder, MaterialTheme.colorScheme.onBackground) { navController.navigate("execution") }
-            NavChip("LOGS", CardBorder, MaterialTheme.colorScheme.onBackground) { navController.navigate("logs") }
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.padding(top = 6.dp)) {
-            NavChip("HISTORY", CardBorder, MaterialTheme.colorScheme.onBackground) { navController.navigate("trade_history") }
-            NavChip("MARKET", CardBorder, MaterialTheme.colorScheme.onBackground) { navController.navigate("market") }
-            NavChip("PAPER/LIVE", CardBorder, MaterialTheme.colorScheme.onBackground) { navController.navigate("paper_live") }
-            NavChip("CONNECTION", CardBorder, MaterialTheme.colorScheme.onBackground) { navController.navigate("connection") }
-        }
+        // Navigation lives in the bottom bar and its Menu tab; these chips used to
+        // sit here too, duplicating it and pushing the dashboard panels off-screen.
 
         Spacer(Modifier.height(12.dp))
         SectionTitle("Connection")
@@ -335,18 +324,6 @@ fun OpportunityCard(opp: com.hakim3691.bta.scanner.OpportunityUi, onClick: () ->
     }
 }
 
-
-@Composable
-fun NavChip(label: String, border: Color, textColor: Color, onClick: () -> Unit) {
-    androidx.compose.material3.OutlinedButton(
-        onClick = onClick,
-        border = androidx.compose.foundation.BorderStroke(1.dp, border),
-        colors = androidx.compose.material3.ButtonDefaults.outlinedButtonColors(contentColor = textColor),
-        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 4.dp)
-    ) {
-        Text(label, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-    }
-}
 
 /**
  * Telemetry for the staged executor.

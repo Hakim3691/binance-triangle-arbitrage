@@ -244,7 +244,10 @@ private fun saveLogText(context: Context, entries: List<LogEntry>): File? {
         dir.mkdirs()
         val file = File(dir, "bta_log_" + System.currentTimeMillis() + ".txt")
         file.writeText(buildLogExport(entries))
-        LogRepository.info("logs", "Saved " + entries.size + " lines to " + file.name)
+        // The absolute path, not just the file name. App-private external storage is
+        // somewhere different on every device, so a bare name leaves the reader
+        // guessing where the file actually landed.
+        LogRepository.info("logs", "Saved " + entries.size + " lines to " + file.absolutePath)
         file
     } catch (e: Exception) {
         LogRepository.error("logs", "Could not save log: " + e.message)

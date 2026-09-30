@@ -46,9 +46,27 @@ corresponds exactly to mirrored commit `2d4dad0` is available separately:
 | `targetSdk` / `compileSdk` | 34 (Android 14) |
 
 `versionName` carries the git commit it was built from, so the string
-`1.0.20+2d4dad0` is a quick way to confirm the binary matches this source. The
-`versionCode`/`versionName` pair is derived from git at build time in
-`app/build.gradle.kts`, so it is only meaningful when built from this history.
+`1.0.20+2d4dad0` is a quick way to confirm the binary matches this source.
+
+**Caveat for builds made from this branch.** `versionCode`/`versionName` are
+derived from git at build time in `app/build.gradle.kts`, but only when the
+project directory is itself the root of a git checkout. Here it is not - it sits
+inside the Node.js repository - so a build from this branch reports
+`1.0.20+nosha` and `versionCode=20` (the pinned fallback in
+`gradle.properties`) rather than `1.0.20+2d4dad0`. The `+nosha` suffix is
+deliberate: it means "no provenance available", not a borrowed commit id.
+
+Consequences for anyone comparing binaries:
+
+- `versionCode`/`versionName` will **not** match the table above when rebuilt here.
+- The md5 will **not** match `e358948c6b95525c2dd6254327ce6732`, because the
+  version strings are embedded in the manifest.
+- The APK *is* otherwise equivalent - same source, same SDK, same signing scheme.
+- The build is reproducible in the sense that matters: the same commit in the
+  standalone repository always produces `1.0.20+2d4dad0` and the same md5.
+
+Once this lives in its own repository again, the original provenance behaviour
+returns automatically with no build-file change.
 
 To verify a download before installing:
 
