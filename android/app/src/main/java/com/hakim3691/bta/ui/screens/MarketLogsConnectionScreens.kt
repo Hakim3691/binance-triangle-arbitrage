@@ -210,6 +210,25 @@ private fun ResearchPanel(viewModel: ArbViewModel) {
 
 /** Hands the CSVs to the system share sheet through the FileProvider. */
 private fun shareResearchFiles(context: Context, files: List<File>) {
+    // Also copy into public Downloads. The share sheet needs the user to pick a
+    // destination, but the CSVs are the whole point of the Stage 3 study and
+    // they live where no file manager can reach them, so a silent copy makes
+    // them collectable without depending on which app the share lands in.
+    var published = 0
+    for (f in files) {
+        try {
+            if (publishToDownloads(context, f.name, f.readBytes()) != null) published++
+        } catch (e: Exception) {
+            LogRepository.warn("research", "Could not copy " + f.name + " to Downloads: " + e.message)
+        }
+    }
+    if (published > 0) {
+        LogRepository.info(
+            "research",
+            "Copied $published research CSV(s) to the Downloads folder as well"
+        )
+    }
+
     val uris = ArrayList<android.net.Uri>()
     for (f in files) {
         try {
@@ -250,6 +269,29 @@ private fun shareResearchFiles(context: Context, files: List<File>) {
  */
 private fun saveLogText(context: Context, entries: List<LogEntry>): File? {
     val name = "bta_log_" + System.currentTimeMillis() + ".txt"
+    val body = buildLogExport(entries).toByteArray()
+
+    // Public Downloads first: it is the only location a file manager can actually
+    // open, since Android 11 blocks browsing Android/data.
+    val public = publishToDownloads(context, name, body)
+    if (public != null) {
+        LogRepository.info(
+            "logs",
+            "Saved " + entries.size + " lines to " + public + " (full path: " +
+                "Downloads/" + name + ")"
+        )
+        // Still keep an app-private copy so the file survives a reboot and remains
+        // reachable through the FileProvider.
+        return writePrivateCopy(context, name, body)
+    }
+
+    val privateCopy = writePrivateCopy(context, name, body)
+    reportExportOutcome("log (" + entries.size + " lines)", privateCopy, null)
+    return privateCopy
+}
+
+/** Best-effort app-private copy, used when Downloads is unavailable. */
+private fun writePrivateCopy(context: Context, name: String, body: ByteArray): File? {
     val external = context.getExternalFilesDir(null)
     val candidates = listOfNotNull(
         external?.let { File(it, "exports") },
@@ -259,17 +301,12 @@ private fun saveLogText(context: Context, entries: List<LogEntry>): File? {
         try {
             if (!dir.isDirectory && !dir.mkdirs()) continue
             val file = File(dir, name)
-            file.writeText(buildLogExport(entries))
-            // The absolute path, not just the file name. App-private storage
-            // resolves differently on every device, so a bare name leaves the
-            // reader guessing where the file actually landed.
-            LogRepository.info("logs", "Saved " + entries.size + " lines to " + file.absolutePath)
+            file.writeBytes(body)
             return file
         } catch (e: Exception) {
             LogRepository.error("logs", "Could not write to " + dir.absolutePath + ": " + e.message)
         }
     }
-    LogRepository.error("logs", "Could not save log: no writable directory")
     return null
 }
 
