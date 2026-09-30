@@ -43,6 +43,14 @@ class LoopTracker(
     /** Combinations still unseen in the current loop. */
     val remaining: Int get() = pending.size
 
+    /**
+     * Combinations this loop has not reached yet. Non-zero at the end of a run
+     * means something in the universe can never be visited - typically a
+     * triangle whose legs are all permanently dead tickers, so no depth event
+     * ever names it. Surfaced rather than left as a mystery 99%.
+     */
+    val blocked: Int get() = pending.size
+
     /** Combinations already seen in the current loop. */
     val covered: Int get() = (total - pending.size).coerceAtLeast(0)
 
@@ -58,17 +66,27 @@ class LoopTracker(
     }
 
     /**
-     * Records the combinations evaluated in one scan cycle.
+     * Records the combinations reached in one scan cycle.
      *
+     * @param evaluatedIds combinations that were actually priced. This is the
+     *   work counter, and is deliberately narrower than coverage.
+     * @param visitedIds every combination the cycle reached a decision about,
+     *   including ones deliberately skipped as stale. Coverage means "the
+     *   scanner has now looked at this", and a triangle rejected for a stale leg
+     *   has been looked at just as surely as one that produced a price.
      * @return true when this call completed a loop (loopCount has advanced).
      */
-    fun record(evaluatedIds: Collection<String>): Boolean {
+    @JvmOverloads
+    fun record(
+        evaluatedIds: Collection<String>,
+        visitedIds: Collection<String> = evaluatedIds
+    ): Boolean {
         if (universe.isEmpty()) return false
         // An empty pending set means the previous cycle closed a loop; the next
         // cycle must not be credited to it.
         if (pending.isEmpty()) reset(universe)
 
-        for (id in evaluatedIds) pending.remove(id)
+        for (id in visitedIds) pending.remove(id)
         trianglesEvaluated += evaluatedIds.size.toLong()
 
         if (pending.isNotEmpty()) return false
@@ -86,7 +104,8 @@ class LoopTracker(
         trianglesTotal = total,
         trianglesCovered = covered,
         progress = progress,
-        lastLoopMs = lastLoopMs
+        lastLoopMs = lastLoopMs,
+        blocked = blocked
     )
 }
 
@@ -96,5 +115,7 @@ data class LoopSnapshot(
     val trianglesTotal: Int,
     val trianglesCovered: Int,
     val progress: Float,
-    val lastLoopMs: Long
+    val lastLoopMs: Long,
+    /** Combinations never reached yet; a non-zero tail means unreachable legs. */
+    val blocked: Int = 0
 )

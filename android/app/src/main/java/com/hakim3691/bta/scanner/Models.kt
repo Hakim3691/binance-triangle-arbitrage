@@ -149,6 +149,13 @@ data class ScanPerformance(
     val trianglesTotal: Int = 0,
     /** Progress through the current loop, 0..1. */
     val loopProgress: Float = 0f,
+    /**
+     * Combinations never reached yet. Non-zero at the end of a run means some
+     * triangles can never be visited because every one of their legs is an
+     * inactive ticker, so progress will sit permanently short of 100%. Shown
+     * rather than hidden so a stalled loop is distinguishable from a slow one.
+     */
+    val blockedCount: Int = 0,
     /** Wall-clock ms taken by the last completed loop. */
     val lastLoopMs: Long = 0,
     /** Completed loops per minute of uptime, 0 before the scanner has started. */

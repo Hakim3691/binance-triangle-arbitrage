@@ -20,32 +20,31 @@ val isOwnGitCheckout: Boolean = run {
     topLevel.isNotEmpty() && topLevel == rootDir.canonicalPath
 }
 
-val gitCommitCount: Int = if (isOwnGitCheckout) {
-    providers.exec { commandLine("git", "rev-list", "--count", "HEAD") }
-        .standardOutput.asText.get().trim().toIntOrNull() ?: 0
-} else 0
-
 val gitShortSha: String = if (isOwnGitCheckout) {
     providers.exec { commandLine("git", "rev-parse", "--short", "HEAD") }
         .standardOutput.asText.get().trim()
-} else ""
+} else "unknown"
 
-// Pinned fallbacks, overridable with -Pbta.versionCode=42 or from gradle.properties.
-// Used when there is no git history to derive from, so a source export still gets a
-// meaningful, monotonic version instead of a fabricated one.
-val pinnedVersionCode: Int = (findProperty("bta.versionCode") as String?)?.toIntOrNull() ?: 20
-val pinnedVersionName: String = (findProperty("bta.versionName") as String?) ?: "1.0.20"
+// Version identity is COMMITTED, not derived from git history.
+//
+// It used to be `1.0.<commit count>+<sha>`, which meant the same source tree
+// produced a different APK depending on which repository happened to contain it:
+// 1.0.20+2d4dad0 from the standalone repo, 1.0.3+a7d3574 from the mirror inside
+// the Node repo, 1.0.20+nosha from an export. Three identities for one piece of
+// code makes an md5 check meaningless and makes "which build am I installing?"
+// unanswerable.
+//
+// bta.versionCode / bta.versionName live in gradle.properties and are bumped
+// explicitly by whoever changes the code, so every checkout of the same commit
+// produces the same APK. The commit is still recorded - as a separate
+// BuildConfig field shown under Connection -> Build - so provenance is visible
+// without destabilising the version.
+val pinnedVersionCode: Int = (findProperty("bta.versionCode") as String?)?.toIntOrNull() ?: 1
+val pinnedVersionName: String = (findProperty("bta.versionName") as String?) ?: "1.0.0"
 
-val resolvedVersionCode: Int = if (gitCommitCount > 0) gitCommitCount else pinnedVersionCode
-
-val resolvedVersionName: String = when {
-    // A real checkout: version tracks its own history, so the same commit always
-    // builds to the same version and two commits are always distinguishable.
-    gitCommitCount > 0 && gitShortSha.isNotEmpty() -> "1.0.$gitCommitCount+$gitShortSha"
-    // No usable history. The suffix admits that rather than borrowing another
-    // repository's identity.
-    else -> "$pinnedVersionName+nosha"
-}
+val resolvedVersionCode: Int = pinnedVersionCode
+val resolvedVersionName: String = pinnedVersionName
+val buildCommit: String = gitShortSha
 
 android {
     namespace = "com.hakim3691.bta"
@@ -55,18 +54,12 @@ android {
         applicationId = "com.hakim3691.bta"
         minSdk = 26
         targetSdk = 34
-        // Derived from git so every build is distinguishable in the launcher.
-        // Seventeen APKs all reading "1.0.0" makes it impossible to tell which
-        // one is installed.
-        //
-        // The git lookup is deliberately scoped to THIS project directory. A bare
-        // `git rev-parse` walks upwards and happily reports whatever repository
-        // happens to contain the build, so building these sources from a copy
-        // parked in an unrelated repo stamped the version with that repo's
-        // history (1.0.3+a7d3574) instead of this project's. The commit suffix
-        // is only added when this directory is itself the repository root;
-        // otherwise the build falls back to the pinned bta.version.* properties
-        // in gradle.properties rather than inventing a provenance it does not have.
+        // Committed in gradle.properties (bta.versionCode / bta.versionName) rather
+        // than derived from git, so every checkout of this commit produces an
+        // identical APK. Seventeen APKs all reading "1.0.0" is still a real
+        // problem, but it is solved by bumping the property when the code changes,
+        // not by letting the surrounding repository decide. The commit is
+        // reported separately as BuildConfig.BUILD_COMMIT.
         versionCode = resolvedVersionCode
         versionName = resolvedVersionName
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -90,6 +83,7 @@ android {
         compose = true
         buildConfig = true
     }
+    buildConfigField("String", "BUILD_COMMIT", "\"$buildCommit\"")
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"

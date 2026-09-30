@@ -746,13 +746,32 @@ class ScannerController(
                     "(per-ticker quiet-book tolerance " + QUIET_BOOK_TOLERANCE + "x)"
             }
         }
-        if (loopTracker.record(trades.map { it.id })) {
+        // Coverage counts everything this cycle reached a decision about, not
+        // just the triangles that produced a price. Crediting only `trades` made
+        // a loop impossible to close whenever any combination was skipped as
+        // stale, because a permanently quiet pair is skipped on every cycle for
+        // the life of the process - so loopCount stayed pinned at 0 with
+        // progress stuck just short of 100%, and "LOOPS/MIN 0.0" read like the
+        // scanner was not working at all.
+        if (loopTracker.record(trades.map { it.id }, filterResult.complete.map { it.id })) {
             val snap = loopTracker.snapshot()
             LogRepository.info(
                 "performance",
                 "Loop #${snap.loopCount} complete: all ${snap.trianglesTotal} combinations " +
-                    "evaluated in ${snap.lastLoopMs}ms (${snap.trianglesEvaluated} total so far)"
+                    "reached in ${snap.lastLoopMs}ms (${snap.trianglesEvaluated} priced so far)"
             )
+        } else if (loopTracker.blocked > 0) {
+            // A tail that never shrinks means those combinations are unreachable,
+            // which is worth saying out loud rather than showing as a stalled 99%.
+            LogRepository.throttled(
+                LogLevel.DEBUG,
+                "performance",
+                "loop-blocked",
+                SKIP_LOG_THROTTLE_MS
+            ) {
+                "Loop coverage stalled: ${loopTracker.blocked} of ${loopTracker.total} " +
+                    "combinations never reached (all their legs are inactive)"
+            }
         }
         if (filterResult.skippedTradeCount > 0) {
             val tickers = filterResult.skippedByTicker.entries
@@ -1315,6 +1334,7 @@ class ScannerController(
                 trianglesEvaluated = loop.trianglesEvaluated,
                 trianglesTotal = loop.trianglesTotal,
                 loopProgress = loop.progress,
+                blockedCount = loop.blocked,
                 lastLoopMs = loop.lastLoopMs,
                 loopsPerMinute = loopsPerMinute()
             )

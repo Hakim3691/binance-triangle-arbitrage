@@ -346,6 +346,10 @@ fun ConnectionScreen(viewModel: ArbViewModel, navController: NavController) {
             )
             KeyValueRow("Package", com.hakim3691.bta.BuildConfig.APPLICATION_ID)
             KeyValueRow("Flavor", com.hakim3691.bta.BuildConfig.BUILD_TYPE)
+            // Kept out of versionName on purpose: the version is a committed
+            // value so every checkout builds identically, and the commit is
+            // reported here as provenance without destabilising that.
+            KeyValueRow("Commit", com.hakim3691.bta.BuildConfig.BUILD_COMMIT)
         }
         Spacer(Modifier.height(10.dp))
         SectionTitle("Scanner")

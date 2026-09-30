@@ -154,7 +154,17 @@ fun DashboardScreen(viewModel: ArbViewModel, navController: NavController) {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             StatCard("LOOPS", "${performance.loopCount}", modifier = Modifier.weight(1f),
                 valueColor = if (performance.loopCount > 0) ProfitGreen else TextSecondary)
-            StatCard("LOOP PROG", "${(performance.loopProgress * 100).toInt()}%", modifier = Modifier.weight(1f))
+            // Coverage is over the whole universe, so show the unreachable tail
+            // alongside it. A loop that cannot close because a handful of
+            // combinations are permanently inactive is a different situation from
+            // a scanner that has not finished a pass yet, and "99%" alone could
+            // not tell them apart.
+            StatCard(
+                "LOOP PROG",
+                "${(performance.loopProgress * 100).toInt()}%" +
+                    if (performance.blockedCount > 0) " (${performance.blockedCount} idle)" else "",
+                modifier = Modifier.weight(1f)
+            )
             StatCard("LAST LOOP", "${performance.lastLoopMs} ms", modifier = Modifier.weight(1f))
         }
         Spacer(Modifier.height(6.dp))
@@ -165,9 +175,13 @@ fun DashboardScreen(viewModel: ArbViewModel, navController: NavController) {
         }
 
         Spacer(Modifier.height(12.dp))
-        SectionTitle("Market Scan (last cycle)")
+        SectionTitle("Market Scan (last depth event)")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            StatCard("SCANNED", "$scannedCount", modifier = Modifier.weight(1f))
+            // A scan is event driven: one depth update only re-prices the
+            // triangles containing the ticker that moved, so this is a handful
+            // even when the universe is large. The cumulative LOOPS/EVALUATED
+            // counters above are the ones that describe total coverage.
+            StatCard("PRICED (EVENT)", "$scannedCount", modifier = Modifier.weight(1f))
             StatCard("PROFITABLE", if (isRunning) "$profitable" else "0", modifier = Modifier.weight(1f),
                 valueColor = if (profitable > 0 && isRunning) ProfitGreen else TextSecondary)
             StatCard("EXECUTIONS", "${viewModel.executions.collectAsState().value.size}", modifier = Modifier.weight(1f))
