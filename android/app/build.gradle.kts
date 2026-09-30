@@ -62,6 +62,10 @@ android {
         // reported separately as BuildConfig.BUILD_COMMIT.
         versionCode = resolvedVersionCode
         versionName = resolvedVersionName
+        // Provenance is reported separately from the version, so the committed
+        // version stays identical across checkouts while the build still says
+        // which commit it came from.
+        buildConfigField("String", "BUILD_COMMIT", "\"$buildCommit\"")
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -83,7 +87,6 @@ android {
         compose = true
         buildConfig = true
     }
-    buildConfigField("String", "BUILD_COMMIT", "\"$buildCommit\"")
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
