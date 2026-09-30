@@ -33,15 +33,17 @@ class ExportDirectoryTest {
 
     @Test
     fun `writing under a null parent succeeds against the working directory`() {
+        // Everything is created inside a temp dir and removed afterwards. The
+        // point of this test is to reproduce the old failure mode, and doing so
+        // in the real working directory would leave a stray folder in the source
+        // tree where it can be committed by accident.
         val sandbox = createTempDir()
-        val previous = System.getProperty("user.dir")
+        val probe = File(sandbox, "exports-probe")
 
         try {
-            // Reproduce the old behaviour: relative to the process CWD.
-            System.setProperty("user.dir", sandbox.absolutePath)
-            val relative = File("exports-probe")
-            relative.mkdirs()
-            val written = File(relative, "bta_log_probe.txt")
+            // Reproduce the old behaviour: relative to some working directory.
+            probe.mkdirs()
+            val written = File(probe, "bta_log_probe.txt")
             written.writeText("x")
 
             // It reports success and produces a file - in the wrong place. That
@@ -52,8 +54,8 @@ class ExportDirectoryTest {
                 written.absolutePath.startsWith("/storage/emulated")
             )
         } finally {
-            relativeCleanup(sandbox)
-            if (previous != null) System.setProperty("user.dir", previous)
+            probe.deleteRecursively()
+            sandbox.deleteRecursively()
         }
     }
 
@@ -69,12 +71,8 @@ class ExportDirectoryTest {
             assertTrue(file.absolutePath.startsWith(base.absolutePath))
             assertEquals("hello", file.readText())
         } finally {
-            relativeCleanup(base)
+            base.deleteRecursively()
         }
-    }
-
-    private fun relativeCleanup(dir: File) {
-        dir.deleteRecursively()
     }
 
     private fun createTempDir(): File =
