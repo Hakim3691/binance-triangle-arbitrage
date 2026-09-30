@@ -36,6 +36,7 @@ import com.hakim3691.bta.log.LogRepository
 import com.hakim3691.bta.ui.theme.BtaYellow
 import java.io.File
 import com.hakim3691.bta.market.WsStatus
+import com.hakim3691.bta.scanner.ScannerState
 import com.hakim3691.bta.ui.ArbViewModel
 import com.hakim3691.bta.ui.theme.LossRed
 import com.hakim3691.bta.ui.theme.ProfitGreen
@@ -165,6 +166,8 @@ private fun ResearchPanel(viewModel: ArbViewModel) {
     val files = viewModel.researchFiles()
     val episodeRows = viewModel.researchRowCount().first
     val summaryRows = viewModel.researchRowCount().second
+    val researchInfo by viewModel.researchInfo.collectAsState()
+    val isRunning = viewModel.scannerState.value == ScannerState.RUNNING
 
     Column(Modifier.padding(horizontal = 14.dp, vertical = 10.dp)) {
         Text(
@@ -177,9 +180,20 @@ private fun ResearchPanel(viewModel: ArbViewModel) {
         CardPanel {
             KeyValueRow("Arm episodes", "$episodeRows rows")
             KeyValueRow("Interval summaries", "$summaryRows rows")
+            KeyValueRow("Recorder", researchInfo)
             if (files.isEmpty()) {
                 Text(
-                    "No rows collected yet - recording starts when the scanner starts.",
+                    // Previously this read as a fixed reassurance that recording
+                    // "starts when the scanner starts", which is exactly what was
+                    // untrue: the recorder was never attached, and a hardcoded
+                    // reassurance hid that from three separate device runs. Now
+                    // the live recorder state is shown beside the row counts.
+                    if (isRunning) {
+                        "Recording. Arm episodes appear when an opportunity is armed; " +
+                            "interval summaries are written every 5 minutes."
+                    } else {
+                        "No rows yet - start the scanner to begin collecting."
+                    },
                     color = TextSecondary,
                     fontSize = 11.sp
                 )

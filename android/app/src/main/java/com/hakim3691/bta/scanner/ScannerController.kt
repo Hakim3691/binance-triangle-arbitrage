@@ -171,16 +171,37 @@ class ScannerController(
      * Called from start() when a context is available; harmless to call again.
      */
     private fun ensureResearchRecorder() {
-        val ctx = appContext ?: return
         if (researchRecorder != null) return
-        val dir = java.io.File(ctx.getExternalFilesDir(null), "research")
-        if (!dir.exists()) dir.mkdirs()
-        researchRecorder = ResearchRecorder(dir).also { it.newSession() }
-        LogRepository.info(
-            "research",
-            "Collecting arm episodes + interval summaries to ${dir.absolutePath}"
-        )
-        _researchInfo.value = "research: collecting (5-min summaries)"
+        val ctx = appContext
+        if (ctx == null) {
+            // Loudly, because silence here is what made the Stage 3 study look
+            // like a market result when it was really a wiring bug.
+            LogRepository.error(
+                "research",
+                "CSV collection unavailable: no application context - arm episodes and " +
+                    "interval summaries will NOT be recorded this session"
+            )
+            _researchInfo.value = "research: unavailable (no context)"
+            return
+        }
+        try {
+            val base = ctx.getExternalFilesDir(null) ?: ctx.filesDir
+            val dir = java.io.File(base, "research")
+            if (!dir.exists() && !dir.mkdirs()) {
+                LogRepository.error("research", "Could not create " + dir.absolutePath)
+                _researchInfo.value = "research: could not create output directory"
+                return
+            }
+            researchRecorder = ResearchRecorder(dir).also { it.newSession() }
+            LogRepository.info(
+                "research",
+                "Collecting arm episodes + interval summaries to ${dir.absolutePath}"
+            )
+            _researchInfo.value = "research: collecting (5-min summaries)"
+        } catch (e: Exception) {
+            LogRepository.error("research", "Could not start CSV collection: ${e.message}")
+            _researchInfo.value = "research: failed to start"
+        }
     }
 
     /** One episode row per finished arm, with the features it was armed on. */
@@ -394,6 +415,13 @@ class ScannerController(
         if (_state.value == ScannerState.RUNNING || _state.value == ScannerState.INITIALIZING) return
         try {
             _state.value = ScannerState.INITIALIZING
+            // Attach CSV collection before anything can record. This call was
+            // missing entirely, so researchRecorder stayed null for the whole
+            // session and every recorder guarded by `?: return` dropped its rows
+            // silently - the Stage 3 panel read "0 rows" forever with no error
+            // anywhere, and the summary CSV that decides whether a model is
+            // warranted was never written.
+            ensureResearchRecorder()
             LogRepository.info("main", "Checking latency ...")
 
             val (apiKey, apiSecret) = credentialProvider()
