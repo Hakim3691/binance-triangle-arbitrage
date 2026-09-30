@@ -1,0 +1,485 @@
+{
+  "generatedWith": "original src/main/CalculationNode.js (bmino binance-triangle-arbitrage)",
+  "config": {
+    "EXECUTION": {
+      "FEE": 0.1,
+      "TEMPLATE": [
+        "*",
+        "*",
+        "*"
+      ]
+    },
+    "SCANNING": {
+      "WHITELIST": []
+    },
+    "INVESTMENT": {
+      "BTC": {
+        "MIN": 0.005,
+        "MAX": 0.015,
+        "STEP": 0.005
+      },
+      "USDT": {
+        "MIN": 100,
+        "MAX": 300,
+        "STEP": 100
+      }
+    }
+  },
+  "depth": {
+    "ab": {
+      "bids": {
+        "21000.00000000": 0.5,
+        "20999.50000000": 1.2,
+        "20998.00000000": 3
+      },
+      "asks": {
+        "21001.00000000": 0.4,
+        "21002.50000000": 0.9,
+        "21004.00000000": 2.5
+      },
+      "eventTime": 1700000000000
+    },
+    "bc": {
+      "bids": {
+        "6.15000000": 8,
+        "6.14000000": 12,
+        "6.10000000": 20
+      },
+      "asks": {
+        "6.20000000": 6,
+        "6.22000000": 9.5,
+        "6.25000000": 15
+      },
+      "eventTime": 1700000000001
+    },
+    "ca": {
+      "bids": {
+        "0.00690000": 300,
+        "0.00680000": 500,
+        "0.00670000": 900
+      },
+      "asks": {
+        "0.00700000": 250,
+        "0.00710000": 400,
+        "0.00720000": 800
+      },
+      "eventTime": 1700000000002
+    }
+  },
+  "triangles": {
+    "btc_eth_bnb": {
+      "ab": {
+        "method": "BUY",
+        "ticker": "ETHBTC",
+        "base": "ETH",
+        "quote": "BTC",
+        "dustDecimals": 5
+      },
+      "bc": {
+        "method": "BUY",
+        "ticker": "BNBETH",
+        "base": "BNB",
+        "quote": "ETH",
+        "dustDecimals": 2
+      },
+      "ca": {
+        "method": "SELL",
+        "ticker": "BNBBTC",
+        "base": "BNB",
+        "quote": "BTC",
+        "dustDecimals": 6
+      },
+      "symbol": {
+        "a": "BTC",
+        "b": "ETH",
+        "c": "BNB"
+      }
+    },
+    "btc_ltc_usdt": {
+      "ab": {
+        "method": "BUY",
+        "ticker": "LTCBTC",
+        "base": "LTC",
+        "quote": "BTC",
+        "dustDecimals": 3
+      },
+      "bc": {
+        "method": "SELL",
+        "ticker": "LTCUSDT",
+        "base": "LTC",
+        "quote": "USDT",
+        "dustDecimals": 3
+      },
+      "ca": {
+        "method": "BUY",
+        "ticker": "BTCUSDT",
+        "base": "BTC",
+        "quote": "USDT",
+        "dustDecimals": 2
+      },
+      "symbol": {
+        "a": "BTC",
+        "b": "LTC",
+        "c": "USDT"
+      }
+    },
+    "usdt_eth_btc": {
+      "ab": {
+        "method": "BUY",
+        "ticker": "ETHUSDT",
+        "base": "ETH",
+        "quote": "USDT",
+        "dustDecimals": 4
+      },
+      "bc": {
+        "method": "SELL",
+        "ticker": "ETHBTC",
+        "base": "ETH",
+        "quote": "BTC",
+        "dustDecimals": 5
+      },
+      "ca": {
+        "method": "SELL",
+        "ticker": "BTCUSDT",
+        "base": "BTC",
+        "quote": "USDT",
+        "dustDecimals": 2
+      },
+      "symbol": {
+        "a": "USDT",
+        "b": "ETH",
+        "c": "BTC"
+      }
+    }
+  },
+  "unitProbes": {
+    "orderBookConversion": {
+      "bid_full_walk": {
+        "value": 1,
+        "depth": 1
+      },
+      "bid_partial_last": {
+        "value": 1.49,
+        "depth": 2
+      },
+      "ask_buy": {
+        "value": 4.653846153846153,
+        "depth": 2
+      },
+      "shallow_bid": {
+        "error": "Bid depth (1) too shallow to convert 98 XRP to USDT using XRPUSDT"
+      },
+      "shallow_ask": {
+        "error": "Ask depth (1) too shallow to convert 98.98 USDT to XRP using XRPUSDT"
+      }
+    },
+    "calculateDustless": {
+      "int_passthrough": 42,
+      "trunc_8": 0.12345678,
+      "trunc_0": 12,
+      "trunc_2": 3.14
+    },
+    "orderBookReverseConversion": {
+      "rev_ask": {
+        "value": 0.51,
+        "depth": 1
+      },
+      "rev_bid": {
+        "value": 2,
+        "depth": 1
+      }
+    },
+    "depthRequirement": {
+      "sell_1_5": 2,
+      "buy_1_0": 2,
+      "insufficient": 1
+    }
+  },
+  "calculations": {
+    "btc_eth_bnb": [
+      {
+        "id": "BTC-ETH-BNB",
+        "percent": -100,
+        "ab": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "bc": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "ca": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "a": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        },
+        "b": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        },
+        "c": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        }
+      },
+      {
+        "id": "BTC-ETH-BNB",
+        "percent": -100,
+        "ab": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "bc": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "ca": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "a": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        },
+        "b": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        },
+        "c": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        }
+      },
+      {
+        "id": "BTC-ETH-BNB",
+        "percent": -100,
+        "ab": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "bc": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "ca": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "a": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        },
+        "b": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        },
+        "c": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        }
+      }
+    ],
+    "btc_ltc_usdt": [
+      {
+        "id": "BTC-LTC-USDT",
+        "percent": -100,
+        "ab": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "bc": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "ca": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "a": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        },
+        "b": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        },
+        "c": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        }
+      },
+      {
+        "id": "BTC-LTC-USDT",
+        "percent": -100,
+        "ab": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "bc": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "ca": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "a": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        },
+        "b": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        },
+        "c": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        }
+      },
+      {
+        "id": "BTC-LTC-USDT",
+        "percent": -100,
+        "ab": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "bc": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "ca": {
+          "quantity": 0,
+          "depth": 0
+        },
+        "a": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        },
+        "b": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        },
+        "c": {
+          "spent": 0,
+          "earned": 0,
+          "delta": 0
+        }
+      }
+    ],
+    "usdt_eth_btc": [
+      {
+        "id": "USDT-ETH-BTC",
+        "percent": -100.29986018902848,
+        "ab": {
+          "quantity": 0.0047,
+          "depth": 1
+        },
+        "bc": {
+          "quantity": 0.0047,
+          "depth": 1
+        },
+        "ca": {
+          "quantity": 0.02,
+          "depth": 1
+        },
+        "a": {
+          "spent": 98.7047,
+          "earned": 0.000138,
+          "delta": -98.704562
+        },
+        "b": {
+          "spent": 0.0047,
+          "earned": 0.0047,
+          "delta": 0
+        },
+        "c": {
+          "spent": 0.02,
+          "earned": 0.028905000000000004,
+          "delta": 0.008905000000000003
+        }
+      },
+      {
+        "id": "USDT-ETH-BTC",
+        "percent": -100.29982707590365,
+        "ab": {
+          "quantity": 0.0095,
+          "depth": 1
+        },
+        "bc": {
+          "quantity": 0.0095,
+          "depth": 1
+        },
+        "ca": {
+          "quantity": 0.05,
+          "depth": 1
+        },
+        "a": {
+          "spent": 199.5095,
+          "earned": 0.00034500000000000004,
+          "delta": -199.509155
+        },
+        "b": {
+          "spent": 0.0095,
+          "earned": 0.0095,
+          "delta": 0
+        },
+        "c": {
+          "spent": 0.05,
+          "earned": 0.058425000000000005,
+          "delta": 0.008425000000000002
+        }
+      },
+      {
+        "id": "USDT-ETH-BTC",
+        "percent": -100.29981489815039,
+        "ab": {
+          "quantity": 0.0142,
+          "depth": 1
+        },
+        "bc": {
+          "quantity": 0.0142,
+          "depth": 1
+        },
+        "ca": {
+          "quantity": 0.08,
+          "depth": 1
+        },
+        "a": {
+          "spent": 298.2142,
+          "earned": 0.000552,
+          "delta": -298.213648
+        },
+        "b": {
+          "spent": 0.0142,
+          "earned": 0.0142,
+          "delta": 0
+        },
+        "c": {
+          "spent": 0.08,
+          "earned": 0.08733,
+          "delta": 0.007330000000000003
+        }
+      }
+    ]
+  }
+}

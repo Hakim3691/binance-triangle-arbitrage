@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Paths shared through the FileProvider: the research CSVs and log
+     exports written under getExternalFilesDir(null). -->
+<paths>
+    <external-files-path name="external_files" path="." />
+</paths>

@@ -1,0 +1,21 @@
+# Gradle
+.gradle/
+build/
+app/build/
+
+# IDE
+.idea/
+*.iml
+local.properties
+
+# Kotlin
+*.class
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+
+# Generated at runtime by validation/genVectors.js
+validation/configMock.js

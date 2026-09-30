@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">Binance Triangle Arbitrage</string>
+    <string name="notification_channel">Scanner</string>
+    <string name="notification_channel_desc">Shown while the arbitrage scanner is running so it keeps working in the background</string>
+    <string name="notification_title">Scanner running</string>
+    <string name="notification_text">Triangular arbitrage scanner is active - tap to return</string>
+</resources>
