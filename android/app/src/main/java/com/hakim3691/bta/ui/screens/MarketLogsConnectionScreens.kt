@@ -237,22 +237,40 @@ private fun shareResearchFiles(context: Context, files: List<File>) {
     )
 }
 
-/** Writes the visible log buffer to app storage so it can be pulled off the device. */
+/**
+ * Writes the visible log buffer to app storage so it can be pulled off the device.
+ *
+ * `getExternalFilesDir(null)` returns null when no external volume is mounted, and
+ * `File(null, "exports")` silently collapses to the bare relative name "exports",
+ * so the write would land in the process working directory and the reported path
+ * would look plausible while the file was nowhere near it. That is exactly the
+ * failure mode seen on a device where the folder appeared empty. The directory is
+ * therefore resolved to an absolute path and its existence verified before the
+ * write, and the internal cache is used as a fallback so a log is never lost.
+ */
 private fun saveLogText(context: Context, entries: List<LogEntry>): File? {
-    return try {
-        val dir = File(context.getExternalFilesDir(null), "exports")
-        dir.mkdirs()
-        val file = File(dir, "bta_log_" + System.currentTimeMillis() + ".txt")
-        file.writeText(buildLogExport(entries))
-        // The absolute path, not just the file name. App-private external storage is
-        // somewhere different on every device, so a bare name leaves the reader
-        // guessing where the file actually landed.
-        LogRepository.info("logs", "Saved " + entries.size + " lines to " + file.absolutePath)
-        file
-    } catch (e: Exception) {
-        LogRepository.error("logs", "Could not save log: " + e.message)
-        null
+    val name = "bta_log_" + System.currentTimeMillis() + ".txt"
+    val external = context.getExternalFilesDir(null)
+    val candidates = listOfNotNull(
+        external?.let { File(it, "exports") },
+        File(context.filesDir, "exports")
+    )
+    for (dir in candidates) {
+        try {
+            if (!dir.isDirectory && !dir.mkdirs()) continue
+            val file = File(dir, name)
+            file.writeText(buildLogExport(entries))
+            // The absolute path, not just the file name. App-private storage
+            // resolves differently on every device, so a bare name leaves the
+            // reader guessing where the file actually landed.
+            LogRepository.info("logs", "Saved " + entries.size + " lines to " + file.absolutePath)
+            return file
+        } catch (e: Exception) {
+            LogRepository.error("logs", "Could not write to " + dir.absolutePath + ": " + e.message)
+        }
     }
+    LogRepository.error("logs", "Could not save log: no writable directory")
+    return null
 }
 
 /** Plain-text rendering of the log buffer, oldest first. */

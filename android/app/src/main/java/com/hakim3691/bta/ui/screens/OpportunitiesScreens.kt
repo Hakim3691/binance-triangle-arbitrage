@@ -33,6 +33,7 @@ import com.hakim3691.bta.ui.theme.TextSecondary
 fun OpportunitiesScreen(viewModel: ArbViewModel, navController: NavController) {
     val mode by viewModel.mode.collectAsState()
     val all by viewModel.opportunities.collectAsState()
+    val performance by viewModel.performance.collectAsState()
     val profitable = all.filter { it.percent > 0 }
 
     Column(Modifier.fillMaxSize()) {
@@ -44,8 +45,15 @@ fun OpportunitiesScreen(viewModel: ArbViewModel, navController: NavController) {
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 8.dp)
         )
         Text(
-            "Showing profitable opportunities only. ${all.size} triangles are being scanned continuously " +
-                "(the rest are unprofitable after fees).",
+            // `all` is the result of the most recent depth event, which only
+            // re-prices the triangles containing the ticker that moved - so it is
+            // a handful, not the universe. The scanned-universe count lives on
+            // the dashboard; repeating the event's size here read as "only 2
+            // triangles are being scanned", which is not what it means.
+            "Showing profitable opportunities only. The full universe of " +
+                "${performance.trianglesTotal} triangles is scanned " +
+                "continuously; ${all.size} were re-priced on the latest market event " +
+                "(the rest were priced on earlier ones).",
             color = TextSecondary,
             fontSize = 12.sp,
             modifier = Modifier.padding(horizontal = 14.dp)
