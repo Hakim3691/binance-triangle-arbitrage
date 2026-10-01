@@ -534,6 +534,7 @@ private fun AutoBadge(
 private fun CredentialsPanel(viewModel: ArbViewModel) {
     var apiKey by remember { mutableStateOf("") }
     var apiSecret by remember { mutableStateOf("") }
+    val keyStatus by viewModel.keyStatus.collectAsState()
 
     Card(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -544,6 +545,55 @@ private fun CredentialsPanel(viewModel: ArbViewModel) {
                 "Credentials are stored in Android Keystore-backed encrypted storage and are never logged.",
                 color = TextSecondary, fontSize = 12.sp
             )
+            Spacer(Modifier.height(8.dp))
+            // Phase 3: one key, two usage tiers, enforced by the app. Paper
+            // mode signs reads only (fees, permissions); live mode additionally
+            // signs orders after the confirmation phrase on the Paper/Live tab.
+            if (keyStatus.stored) {
+                KeyValueRow("Stored key", keyStatus.maskedKey ?: "stored", valueColor = ProfitGreen)
+                KeyValueRow(
+                    "Read access",
+                    when (keyStatus.canRead) {
+                        true -> "granted"
+                        false -> "DENIED by Binance"
+                        null -> "not checked"
+                    },
+                    valueColor = when (keyStatus.canRead) {
+                        true -> ProfitGreen
+                        false -> LossRed
+                        null -> TextSecondary
+                    }
+                )
+                KeyValueRow(
+                    "Spot trading",
+                    when (keyStatus.canSpotTrade) {
+                        true -> "enabled (live orders possible)"
+                        false -> "DISABLED - paper fees only"
+                        null -> "not checked"
+                    },
+                    valueColor = when (keyStatus.canSpotTrade) {
+                        true -> ProfitGreen
+                        false -> LossRed
+                        null -> TextSecondary
+                    }
+                )
+                KeyValueRow(
+                    "Account taker fee",
+                    keyStatus.feePercent?.let { "%.4f%%".format(it) } ?: "fallback",
+                    valueColor = if (keyStatus.feePercent != null) ProfitGreen else TextSecondary
+                )
+            } else {
+                Text(
+                    "No key stored - paper mode runs on the default fee fallback. " +
+                        "A stored key is used read-only while paper trading.",
+                    color = TextSecondary, fontSize = 11.sp
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                onClick = { viewModel.verifyKey() },
+                modifier = Modifier.fillMaxWidth()
+            ) { Text("VERIFY KEY & FEES") }
             Spacer(Modifier.height(8.dp))
             OutlinedTextField(
                 value = apiKey, onValueChange = { apiKey = it },
@@ -648,12 +698,29 @@ fun PaperLiveScreen(viewModel: ArbViewModel, navController: NavController) {
                 )
                 Spacer(Modifier.height(8.dp))
                 val unlocked = confirmation == ArbViewModel.CONFIRMATION_PHRASE
+                // Phase 3: a key Binance reports as unable to spot-trade cannot
+                // arm live trading - the button stays dead and says why.
+                val keyStatus by viewModel.keyStatus.collectAsState()
+                val keyCannotTrade = keyStatus.canSpotTrade == false
                 Button(
                     onClick = { viewModel.enableLiveTrading(confirmation) },
-                    enabled = unlocked && mode == TradingMode.PAPER,
+                    enabled = unlocked && mode == TradingMode.PAPER && !keyCannotTrade,
                     colors = ButtonDefaults.buttonColors(containerColor = LossRed, contentColor = Color.White),
                     modifier = Modifier.fillMaxWidth()
-                ) { Text("ENABLE LIVE TRADING") }
+                ) {
+                    Text(
+                        if (keyCannotTrade) "BLOCKED: KEY CANNOT SPOT-TRADE"
+                        else "ENABLE LIVE TRADING"
+                    )
+                }
+                if (keyCannotTrade) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "The stored Binance key has spot trading disabled in its API restrictions. " +
+                            "Paper mode continues with account fees; create a key with \"Enable Spot Trading\" to go live.",
+                        color = LossRed, fontSize = 11.sp
+                    )
+                }
             }
         }
 

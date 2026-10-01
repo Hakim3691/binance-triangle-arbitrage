@@ -57,7 +57,14 @@ class RateLimiter(private val maxWeightPerMinute: Int = 6000) {
 class BinanceRestClient(
     private val http: OkHttpClient,
     private val apiKeyProvider: () -> String,
-    private val apiSecretProvider: () -> String
+    private val apiSecretProvider: () -> String,
+    /**
+     * Phase 3 write gate. The centrally stored key is used read-only in paper
+     * mode (fees, permissions) and read-write in live mode; the gate is checked
+     * before any order request is built, so a paper session cannot place a real
+     * order even through a code path bug.
+     */
+    private val writeAccess: () -> Boolean = { true }
 ) {
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -187,6 +194,12 @@ class BinanceRestClient(
         quoteOrderQty: Double? = null,
         newClientOrderId: String? = null
     ): OrderResponse {
+        // Phase 3: checked before the request is even assembled - the failure
+        // must be a local, logged refusal, never a network round trip.
+        check(writeAccess()) {
+            "Order placement refused: the active trading mode grants read-only " +
+                "access to the stored Binance key"
+        }
         // The signature must cover the exact query string that is sent,
         // so the URL is assembled from the signed string directly.
         // (All values used here are URL-safe: symbols, decimal numbers, digits.)
@@ -300,6 +313,48 @@ class BinanceRestClient(
             }
             return out
         }
+    }
+
+    // ------------------------------------------------------------------
+    // GET /sapi/v1/account/apiRestrictions (signed) - what the key may do
+    // ------------------------------------------------------------------
+
+    data class ApiKeyRestrictions(val canRead: Boolean, val canTrade: Boolean)
+
+    /**
+     * The capabilities Binance itself enforces on this key. The app cannot
+     * change them; it can only detect them - and refusing to arm live trading
+     * with a key whose spot-trading flag is off is exactly the failure the
+     * confirmation phrase cannot catch.
+     */
+    suspend fun apiKeyRestrictions(): ApiKeyRestrictions {
+        val canonical = "timestamp=" + signedTimestamp() + "&recvWindow=5000"
+        val signature = hmacSha256(apiSecretProvider(), canonical)
+        val url = "$BASE_URL/sapi/v1/account/apiRestrictions?$canonical&signature=$signature"
+        val request = Request.Builder().url(url).header("X-MBX-APIKEY", apiKeyProvider()).build()
+        http.newCall(request).execute().use { resp ->
+            val bodyText = resp.body?.string() ?: "{}"
+            if (!resp.isSuccessful) throw BinanceApiException(resp.code, bodyText.take(200))
+            return parseApiRestrictions(bodyText)
+        }
+    }
+
+    internal fun parseApiRestrictions(bodyText: String): ApiKeyRestrictions {
+        val obj = runCatching { json.parseToJsonElement(bodyText).jsonObject }.getOrNull()
+            ?: throw BinanceApiException(0, bodyText.take(200))
+        // Some deployments wrap the object in "data", some return it bare.
+        val payload = obj["data"]?.jsonObject ?: obj
+        fun flag(name: String): Boolean? =
+            payload[name]?.jsonPrimitive?.let { p ->
+                p.content.toBooleanStrictOrNull()
+            }
+        // Absent fields must not block anything: only an EXPLICIT false from
+        // Binance refuses live trading - the confirmation phrase remains the
+        // primary gate.
+        return ApiKeyRestrictions(
+            canRead = flag("canRead") ?: true,
+            canTrade = flag("canTrade") ?: true
+        )
     }
 
     // ------------------------------------------------------------------

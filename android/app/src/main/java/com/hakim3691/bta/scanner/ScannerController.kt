@@ -39,6 +39,8 @@ import com.hakim3691.bta.paper.PaperTradingEngine
 import com.hakim3691.bta.research.ArmEpisode
 import com.hakim3691.bta.research.IntervalSummary
 import com.hakim3691.bta.research.ResearchRecorder
+import com.hakim3691.bta.security.KeyPolicy
+import com.hakim3691.bta.security.KeyStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -394,6 +396,17 @@ class ScannerController(
     private val _mode = MutableStateFlow(TradingMode.PAPER)
     val mode: StateFlow<TradingMode> = _mode
 
+    /**
+     * Phase 3: what the centrally stored Binance key is and may do. PAPER mode
+     * uses the key READ-ONLY (account fee, permission check); LIVE mode arms
+     * order placement after the confirmation phrase - and only for a key that
+     * Binance itself says can spot-trade.
+     */
+    private val _keyStatus = MutableStateFlow(
+        KeyStatus(stored = false, maskedKey = null, canRead = null, canSpotTrade = null, feePercent = null, checkedAtMs = 0L)
+    )
+    val keyStatus: StateFlow<KeyStatus> = _keyStatus
+
     private val _state = MutableStateFlow(ScannerState.STOPPED)
     val state: StateFlow<ScannerState> = _state
 
@@ -514,7 +527,13 @@ class ScannerController(
                 }
                 .getOrDefault("" to "")
             val (apiKey, apiSecret) = credentials
-            val rest = BinanceRestClient(http, { apiKey }, { apiSecret })
+            // Phase 3: the scanner-side client is READ-ONLY in paper mode. All
+            // real orders go through LiveTradingSession, created only by the
+            // explicit live-mode switch; this gate is the second lock.
+            val rest = BinanceRestClient(
+                http, { apiKey }, { apiSecret },
+                writeAccess = { _mode.value == TradingMode.LIVE }
+            )
             restClient = rest
 
             // SpeedTest.multiPing(5) equivalent + clock skew measurement
@@ -644,8 +663,10 @@ class ScannerController(
             _state.value = ScannerState.WAITING_FOR_DEPTH
 
             // Real account fee rate (Phase 4c), replacing the 0.10% guess when
-            // keys exist. One weight-1 signed call; gracefully skipped without.
-            fetchRealFeeRate(rest)
+            // keys exist, plus the Phase 3 key-permission snapshot. One or two
+            // weight-1 signed calls; gracefully skipped without keys.
+            val accountFeePercent = fetchRealFeeRate(rest)
+            publishKeyStatus(rest, accountFeePercent)
 
             // Dead-book probe (Phase 2a). The initial snapshots are in flight,
             // so the next ~minute tells us which tickers the exchange actually
@@ -777,39 +798,106 @@ class ScannerController(
      * optional: without them the configured fallback stays and the skip is
      * logged once.
      */
-    private suspend fun fetchRealFeeRate(rest: BinanceRestClient) {
-        try {
+    private suspend fun fetchRealFeeRate(rest: BinanceRestClient): Double? {
+        return try {
             val rate = rest.accountTakerCommission()
             if (rate == null) {
                 LogRepository.info(
                     "settings",
                     "Fee rate: no API key or no tradeFee row; keeping ${ExecutionConfig.feePercent}% fallback"
                 )
-                return
+                return null
             }
             val percent = rate * 100.0
-            if (percent > 0.0) {
-                val previous = ExecutionConfig.feePercent
-                if (!ExecutionConfig.feeAuto) {
-                    LogRepository.info(
-                        "settings",
-                        "Fee rate ${percent}% fetched but fee is MANUAL; keeping ${previous}%"
-                    )
-                    return
-                }
+            if (percent <= 0.0) {
+                LogRepository.info(
+                    "settings",
+                    "Fee rate row was $rate; keeping ${ExecutionConfig.feePercent}% fallback"
+                )
+                return null
+            }
+            val previous = ExecutionConfig.feePercent
+            if (!ExecutionConfig.feeAuto) {
+                LogRepository.info(
+                    "settings",
+                    "Fee rate $percent% fetched but fee is MANUAL; keeping $previous%"
+                )
+            } else {
                 ExecutionConfig.feePercent = percent
                 LogRepository.info(
                     "settings",
-                    "Fee rate from account: ${percent}% taker (was ${previous}% fallback)"
+                    "Fee rate from account: $percent% taker (was $previous% fallback)"
                 )
             }
+            percent
         } catch (e: Exception) {
             LogRepository.info(
                 "settings",
                 "Fee rate unavailable: ${e.javaClass.simpleName}: ${e.message}; keeping " +
                     "${ExecutionConfig.feePercent}% fallback"
             )
+            null
         }
+    }
+
+    /**
+     * Phase 3: publishes what the app may do with the centrally stored key.
+     * PAPER mode uses it READ-ONLY (account fee, permission check); LIVE mode
+     * additionally arms order placement after the confirmation phrase.
+     */
+    private suspend fun publishKeyStatus(rest: BinanceRestClient, feePercent: Double?) {
+        val (apiKey, _) = runCatching { credentialProvider() }.getOrDefault("" to "")
+        if (apiKey.isBlank()) {
+            _keyStatus.value = KeyStatus(
+                stored = false, maskedKey = null, canRead = null,
+                canSpotTrade = null, feePercent = null, checkedAtMs = System.currentTimeMillis()
+            )
+            return
+        }
+        val perms = runCatching { rest.apiKeyRestrictions() }
+            .onFailure {
+                LogRepository.info(
+                    "settings",
+                    "Key permission check unavailable: ${it.javaClass.simpleName}: ${it.message}"
+                )
+            }
+            .getOrNull()
+        _keyStatus.value = KeyStatus(
+            stored = true,
+            maskedKey = KeyPolicy.mask(apiKey),
+            canRead = perms?.canRead,
+            canSpotTrade = perms?.canTrade,
+            feePercent = feePercent,
+            checkedAtMs = System.currentTimeMillis()
+        )
+        LogRepository.info(
+            "settings",
+            "API key ${KeyPolicy.mask(apiKey)}: canRead=${perms?.canRead}, " +
+                "canSpotTrade=${perms?.canTrade}, taker fee=${feePercent ?: ExecutionConfig.feePercent}%"
+        )
+    }
+
+    /**
+     * Public re-check for the Settings UI ("VERIFY KEY") and before arming
+     * live trading. Runs on a read-only client: verification can never place
+     * an order, whatever mode the scanner is in.
+     */
+    suspend fun verifyKeyNow() {
+        val (apiKey, apiSecret) = runCatching { credentialProvider() }.getOrDefault("" to "")
+        if (apiKey.isBlank()) {
+            _keyStatus.value = KeyStatus(
+                stored = false, maskedKey = null, canRead = null,
+                canSpotTrade = null, feePercent = null, checkedAtMs = System.currentTimeMillis()
+            )
+            LogRepository.info(
+                "settings",
+                "No Binance key stored - paper mode continues without account fees"
+            )
+            return
+        }
+        val rest = BinanceRestClient(http, { apiKey }, { apiSecret }, writeAccess = { false })
+        val feePercent = fetchRealFeeRate(rest)
+        publishKeyStatus(rest, feePercent)
     }
 
     /**
@@ -1844,8 +1932,18 @@ class ScannerController(
      * Switches execution to LIVE mode. This must be invoked by an explicit user
      * action from the PaperLiveScreen after acknowledging the safety warnings.
      */
-    fun enableLiveTrading(apiKey: String, apiSecret: String, confirmed: Boolean) {
+    fun enableLiveTrading(apiKey: String, apiSecret: String, confirmed: Boolean): Boolean {
         require(confirmed) { "Live trading requires explicit confirmation" }
+        // Phase 3: the key must itself be able to spot-trade. Binance rejects
+        // every order from a read-only key with -2015; catching that HERE is
+        // the difference between a settings warning and three half-filled legs.
+        if (_keyStatus.value.canSpotTrade == false) {
+            LogRepository.error(
+                "settings",
+                "LIVE refused: the stored Binance key has spot trading disabled server-side"
+            )
+            return false
+        }
         val session = LiveTradingSession(apiKey, apiSecret, http, depthCache)
         liveSession = session
         startBnbWatchdog()
@@ -1854,7 +1952,11 @@ class ScannerController(
         }
         KellyConfig.enabled = false
         _mode.value = TradingMode.LIVE
-        LogRepository.warn("execution", "LIVE TRADING ENABLED - real orders will be placed")
+        LogRepository.warn(
+            "execution",
+            "LIVE TRADING ENABLED - real orders will be placed with key ${KeyPolicy.mask(apiKey)}"
+        )
+        return true
     }
 
     fun disableLiveTrading() {

@@ -22,6 +22,7 @@ import com.hakim3691.bta.scanner.ScannerState
 import com.hakim3691.bta.scanner.TradingMode
 import com.hakim3691.bta.research.ResearchRecorder
 import com.hakim3691.bta.security.CredentialStore
+import com.hakim3691.bta.security.KeyStatus
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -70,6 +71,9 @@ class ArbViewModel(
 
     val config: StateFlow<ConfigurationStore.PublicConfig> = configurationStore.configFlow
         .stateIn(viewModelScope, SharingStarted.Lazily, ConfigurationStore.PublicConfig())
+
+    /** Phase 3: what the centrally stored Binance key is and may do. */
+    val keyStatus: StateFlow<KeyStatus> = controller.keyStatus
 
     /** One-shot result message for user actions (save config, live switch, etc). */
     val actionMessage = MutableStateFlow<String?>(null)
@@ -274,6 +278,9 @@ class ArbViewModel(
             try {
                 credentialStore.saveCredentials(apiKey, apiSecret)
                 LogRepository.info("settings", "Binance credentials updated (encrypted at rest)")
+                // Phase 3: the key is usable immediately - verify its
+                // capabilities and pull the account fee without a scanner start.
+                controller.verifyKeyNow()
                 actionMessage.value = "Credentials saved securely"
                 onDone(true)
             } catch (e: Exception) {
@@ -285,7 +292,25 @@ class ArbViewModel(
 
     fun clearCredentials() {
         credentialStore.clear()
+        viewModelScope.launch {
+            controller.verifyKeyNow()
+        }
         actionMessage.value = "Credentials removed from secure storage"
+    }
+
+    /** Phase 3: re-checks the stored key's permissions and account fee. */
+    fun verifyKey() {
+        viewModelScope.launch {
+            controller.verifyKeyNow()
+            val s = controller.keyStatus.value
+            actionMessage.value = when {
+                !s.stored -> "No key stored - paper mode runs without account fees"
+                s.canSpotTrade == true -> "Key ${s.maskedKey}: read OK, spot trading enabled"
+                s.canSpotTrade == false ->
+                    "Key ${s.maskedKey}: read OK, but spot trading is DISABLED - paper fees only"
+                else -> "Key ${s.maskedKey}: stored; permission check unavailable"
+            }
+        }
     }
 
     fun saveConfig(config: ConfigurationStore.PublicConfig) {
@@ -304,7 +329,8 @@ class ArbViewModel(
 
     /**
      * Enables live trading. Requires the user to have typed the confirmation
-     * phrase and stored credentials. Never called automatically.
+     * phrase and stored credentials, and refuses a key Binance reports as
+     * unable to spot-trade. Never called automatically.
      */
     fun enableLiveTrading(confirmation: String) {
         viewModelScope.launch {
@@ -316,12 +342,19 @@ class ArbViewModel(
                 actionMessage.value = "Save Binance API credentials first"
                 return@launch
             }
-            controller.enableLiveTrading(
+            // Learn the key's server-side capabilities before arming orders:
+            // an unchecked key gets checked now, so the refusal below can fire
+            // before the first live triangle instead of at the exchange.
+            if (controller.keyStatus.value.canSpotTrade == null) {
+                controller.verifyKeyNow()
+            }
+            val enabled = controller.enableLiveTrading(
                 credentialStore.getApiKey(),
                 credentialStore.getApiSecret(),
                 confirmed = true
             )
-            actionMessage.value = "LIVE TRADING ENABLED"
+            actionMessage.value = if (enabled) "LIVE TRADING ENABLED"
+            else "LIVE refused: the stored key has spot trading disabled on Binance"
         }
     }
 
