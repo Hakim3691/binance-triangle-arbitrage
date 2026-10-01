@@ -23,6 +23,21 @@ import javax.crypto.spec.SecretKeySpec
 class BinanceApiException(val code: Int, message: String) : Exception(message)
 
 /**
+ * Runs a blocking OkHttp call on the IO dispatcher.
+ *
+ * OkHttp's execute() refuses to run on the Android main thread and throws
+ * NetworkOnMainThreadException. The unsigned helpers already switched
+ * dispatchers, but the five SIGNED entry points did not - and they are the
+ * ones the UI calls from viewModelScope (which runs on Main). That is why
+ * "save key" and "verify key" failed with NetworkOnMainThreadException on
+ * every signed request while the scanner, which reaches the market data from
+ * a background job, worked fine: public endpoints worked, signed ones never
+ * left the main thread.
+ */
+private suspend fun <T> ioCall(block: () -> T): T =
+    withContext(Dispatchers.IO) { block() }
+
+/**
  * Turns a transport failure into something a user can act on.
  *
  * Every REST failure used to surface as the same opaque
@@ -72,6 +87,10 @@ object RestDiagnosis {
         }
 
         // No HTTP response was received at all: this is the device, not Binance.
+        if (t is android.os.NetworkOnMainThreadException) {
+            return "A Binance request was issued from the UI thread. This is an " +
+                "app defect, not a network or key problem."
+        }
         if (t is java.net.UnknownHostException) {
             return "Cannot resolve api.binance.com - no working internet connection."
         }
@@ -88,6 +107,9 @@ object RestDiagnosis {
         if (t is java.io.IOException) {
             return "Network failure reaching Binance: ${raw.take(160)}"
         }
+        // Several Android exceptions carry no message at all; printing a bare
+        // class name next to a colon told the user nothing.
+        if (raw.isEmpty()) return t.javaClass.simpleName
         return "${t.javaClass.simpleName}: ${raw.take(160)}"
     }
 }
@@ -294,9 +316,11 @@ class BinanceRestClient(
             .post(okhttp3.RequestBody.create(null, ByteArray(0)))
             .build()
 
-        http.newCall(request).execute().use { resp ->
-            val bodyText = resp.body?.string() ?: "{}"
-            return parseOrderResponse(bodyText, resp.code)
+        return ioCall {
+            http.newCall(request).execute().use { resp ->
+                val bodyText = resp.body?.string() ?: "{}"
+                parseOrderResponse(bodyText, resp.code)
+            }
         }
     }
 
@@ -353,11 +377,13 @@ class BinanceRestClient(
         val signature = hmacSha256(apiSecretProvider(), canonical)
         val url = "$BASE_URL/api/v3/order?$canonical&signature=$signature"
         val request = Request.Builder().url(url).header("X-MBX-APIKEY", apiKeyProvider()).build()
-        http.newCall(request).execute().use { resp ->
-            val bodyText = resp.body?.string() ?: "{}"
-            if (resp.code == 400) return null // -2013 "Order does not exist"
-            val parsed = parseOrderResponse(bodyText, resp.code)
-            return if (parsed.orderId == null) null else parsed
+        return ioCall {
+            http.newCall(request).execute().use { resp ->
+                val bodyText = resp.body?.string() ?: "{}"
+                if (resp.code == 400) return@use null // -2013 "Order does not exist"
+                val parsed = parseOrderResponse(bodyText, resp.code)
+                if (parsed.orderId == null) null else parsed
+            }
         }
     }
 
@@ -366,6 +392,7 @@ class BinanceRestClient(
         val signature = hmacSha256(apiSecretProvider(), canonical)
         val url = "$BASE_URL/api/v3/account?$canonical&signature=$signature"
         val request = Request.Builder().url(url).header("X-MBX-APIKEY", apiKeyProvider()).build()
+        return ioCall {
         http.newCall(request).execute().use { resp ->
             val bodyText = resp.body?.string() ?: "{}"
             val obj = json.parseToJsonElement(bodyText).jsonObject
@@ -381,7 +408,8 @@ class BinanceRestClient(
                     locked = bo["locked"]!!.jsonPrimitive.double
                 )
             }
-            return out
+            out
+        }
         }
     }
 
@@ -402,10 +430,12 @@ class BinanceRestClient(
         val signature = hmacSha256(apiSecretProvider(), canonical)
         val url = "$BASE_URL/sapi/v1/account/apiRestrictions?$canonical&signature=$signature"
         val request = Request.Builder().url(url).header("X-MBX-APIKEY", apiKeyProvider()).build()
+        return ioCall {
         http.newCall(request).execute().use { resp ->
             val bodyText = resp.body?.string() ?: "{}"
             if (!resp.isSuccessful) throw BinanceApiException(resp.code, bodyText.take(200))
-            return parseApiRestrictions(bodyText)
+            parseApiRestrictions(bodyText)
+        }
         }
     }
 
@@ -449,19 +479,23 @@ class BinanceRestClient(
         val signature = hmacSha256(apiSecretProvider(), canonical)
         val url = "$BASE_URL/sapi/v1/asset/tradeFee?$canonical&signature=$signature"
         val request = Request.Builder().url(url).header("X-MBX-APIKEY", apiKeyProvider()).build()
-        http.newCall(request).execute().use { resp ->
-            val bodyText = resp.body?.string() ?: return null
-            if (!resp.isSuccessful) return null
-            val obj = runCatching { json.parseToJsonElement(bodyText).jsonObject }.getOrNull()
-                ?: return null
-            val rows = obj["tradeFee"]?.jsonArray ?: return null
-            for (row in rows) {
-                val ro = row.jsonObject
-                if (ro["symbol"]?.jsonPrimitive?.content == symbol) {
-                    return ro["takerCommission"]?.jsonPrimitive?.content?.toDoubleOrNull()
+        // Values are returned from the block rather than with `return`: the
+        // call is not inline, so a non-local return out of it is prohibited.
+        return ioCall {
+            http.newCall(request).execute().use { resp ->
+                val bodyText = resp.body?.string() ?: return@use null
+                if (!resp.isSuccessful) return@use null
+                val obj = runCatching { json.parseToJsonElement(bodyText).jsonObject }.getOrNull()
+                    ?: return@use null
+                val rows = obj["tradeFee"]?.jsonArray ?: return@use null
+                for (row in rows) {
+                    val ro = row.jsonObject
+                    if (ro["symbol"]?.jsonPrimitive?.content == symbol) {
+                        return@use ro["takerCommission"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                    }
                 }
+                null
             }
-            return null
         }
     }
 

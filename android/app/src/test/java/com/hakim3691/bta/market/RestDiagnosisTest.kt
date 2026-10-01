@@ -101,8 +101,10 @@ class RestDiagnosisTest {
 
     @Test
     fun `a null message still yields something readable`() {
+        // NetworkOnMainThreadException carries no message at all, so the panel
+        // rendered a bare "NetworkOnMainThreadException:" with nothing after it.
         val described = RestDiagnosis.describe(IllegalStateException())
-        assertTrue(described.isNotBlank())
+        assertEquals("IllegalStateException", described)
     }
 
     @Test
