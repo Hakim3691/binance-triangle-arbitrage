@@ -53,6 +53,37 @@ class MarketCacheTest {
     }
 
     @Test
+    fun `dust grid prefers stepSize over minQty`() {
+        // minQty 1 DOGE would quantise to whole units; stepSize 0.1 says the
+        // exchange actually accepts tenths. The step is the truth about the
+        // grid, the minimum is just where it starts.
+        val cache = MarketCache()
+        val result = cache.initialize(
+            listOf(
+                SymbolInfo(
+                    "DOGEUSDT", "TRADING", "DOGE", "USDT",
+                    listOf(SymbolFilter("LOT_SIZE", minQty = "1.00000000", stepSize = "0.10000000"))
+                ),
+                SymbolInfo(
+                    "SHIBUSDT", "TRADING", "SHIB", "USDT",
+                    listOf(SymbolFilter("LOT_SIZE", minQty = "1000.00000000", stepSize = "1.00000000"))
+                ),
+                // No stepSize: falls back to the original minQty behaviour.
+                SymbolInfo(
+                    "ETHBTC", "TRADING", "ETH", "BTC",
+                    listOf(SymbolFilter("LOT_SIZE", minQty = "0.00001"))
+                )
+            ),
+            setOf("DOGE")
+        )
+        assertEquals(1, result.tradingSymbols["DOGEUSDT"]!!.dustDecimals)
+        // stepSize "1.00000000" is whole-unit quantisation: 0 decimals, not the
+        // 4 that counting into minQty's "1000" would produce.
+        assertEquals(0, result.tradingSymbols["SHIBUSDT"]!!.dustDecimals)
+        assertEquals(5, result.tradingSymbols["ETHBTC"]!!.dustDecimals)
+    }
+
+    @Test
     fun `non-trading symbols are excluded`() {
         val cache = MarketCache()
         val result = cache.initialize(symbols(), setOf("BRK"))

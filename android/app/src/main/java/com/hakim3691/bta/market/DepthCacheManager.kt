@@ -129,13 +129,20 @@ class DepthCacheManager(
         val feedDead: Boolean get() = total > 0 && fresh == 0
     }
 
-    fun freshness(maxAgeMs: Long, now: Long = System.currentTimeMillis()): Freshness {
+    fun freshness(
+        maxAgeMs: Long,
+        now: Long = System.currentTimeMillis(),
+        /** Tickers to leave out of the counts entirely (runtime-quarantined books). */
+        exclude: Collection<String> = emptySet()
+    ): Freshness {
         var synced = 0
         var fresh = 0
         var stalest = 0L
         var freshest = Long.MAX_VALUE
         val stale = ArrayList<String>()
+        val excluded = exclude.toSet()
         for ((ticker, ctx) in contexts) {
+            if (ticker in excluded) continue
             if (ctx.snapshotUpdateId == null) {
                 stale.add(ticker)
                 continue
@@ -147,7 +154,10 @@ class DepthCacheManager(
             if (age <= maxAgeMs) fresh++ else stale.add(ticker)
         }
         return Freshness(
-            total = contexts.size,
+            // Excluded tickers leave the counts entirely - that is the point of
+            // quarantining them - so the banner reports the universe that can
+            // actually be traded.
+            total = contexts.size - excluded.intersect(contexts.keys).size,
             synced = synced,
             fresh = fresh,
             stalestAgeMs = stalest,
@@ -289,6 +299,17 @@ class DepthCacheManager(
         contexts.entries
             .filter { it.value.localEventTime == 0L || now - it.value.localEventTime > maxAgeMs }
             .map { it.key }
+
+    /**
+     * Age in ms of a ticker's last book update, or null when the ticker is not
+     * watched or has never received an update. Used by the runtime quarantine
+     * to decide whether a previously excluded book has come back to life.
+     */
+    fun ageOf(ticker: String, now: Long = clock()): Long? {
+        val ctx = contexts[ticker] ?: return null
+        if (ctx.localEventTime == 0L) return null
+        return now - ctx.localEventTime
+    }
 
     /**
      * Drops every context that is not in [tickers].

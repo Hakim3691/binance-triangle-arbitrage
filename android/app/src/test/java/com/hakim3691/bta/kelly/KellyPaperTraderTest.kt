@@ -220,4 +220,31 @@ class KellyPaperTraderTest {
         // sigma may still be default if cooldown blocked repeats; assert it's positive
         assertTrue(t.sigma() > 0)
     }
+
+    @Test
+    fun `settlement works for a base with no usdt book - routed through the pair graph`() = runTest {
+        // An all-asset universe roots triangles at assets quoted elsewhere. The
+        // ledger must still settle: with BTCUSDT removed, the funding leg buys
+        // BTC through an intermediate and the settlement leg sells it back the
+        // same way, and the outcome is still recorded as a completed trade.
+        PaperTradingEngine.paperUniverse.remove("BTCUSDT")
+        val p2 = PaperTradingEngine(
+            depthProvider = { ticker ->
+                // Fund through ETHUSDT: BUY ETH, then SELL ETH on ETHBTC for BTC.
+                if (ticker == "BTCUSDT") null else books().getValue(ticker)
+            },
+            startingBalance = mapOf("USDT" to 1000.0)
+        )
+        PaperTradingEngine.paperUniverse["ETHBTC"] = "ETH" to "BTC"
+        var completed = 0
+        val t = KellyPaperTrader(
+            paperEngine = p2,
+            arbExecution = com.hakim3691.bta.core.ArbitrageExecution(p2),
+            onTradeCompleted = { _, _ -> completed++ },
+            onStatsChanged = { }
+        )
+        assertTrue(t.consider(makeCalculated()))
+        assertEquals(1, completed)
+        assertTrue(t.snapshotStats().trades == 1)
+    }
 }

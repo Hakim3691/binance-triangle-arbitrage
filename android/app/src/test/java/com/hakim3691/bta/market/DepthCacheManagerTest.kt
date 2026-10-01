@@ -26,6 +26,49 @@ class DepthCacheManagerTest {
     ) = DepthCacheManager.DiffEvent(symbol, U, u, E, bids, asks)
 
     @Test
+    fun `freshness excludes quarantined tickers from the counts but not deadness`() {
+        val now = java.util.concurrent.atomic.AtomicLong(0L)
+        val cache = DepthCacheManager(clock = { now.get() })
+        cache.register(listOf("LIVE", "FROZEN"))
+        // FROZEN last ticked at t=0 and never again; LIVE refreshed at t=9000.
+        cache.applySnapshot("FROZEN", 4, mapOf(1.0 to 1.0), mapOf(2.0 to 1.0))
+        now.set(9_000L)
+        cache.applySnapshot("LIVE", 5, mapOf(1.0 to 1.0), mapOf(2.0 to 1.0))
+        now.set(10_000L)
+
+        // Unfiltered, the frozen book drags the banner to degraded: 1/2.
+        val plain = cache.freshness(5_000L, now = now.get())
+        assertEquals(2, plain.total)
+        assertEquals(1, plain.fresh)
+
+        // Quarantining the frozen one leaves a clean, healthy display.
+        val filtered = cache.freshness(5_000L, now = now.get(), exclude = listOf("FROZEN"))
+        assertEquals(1, filtered.total)
+        assertEquals(1, filtered.fresh)
+        assertFalse(filtered.feedDead)
+        assertEquals(filtered.total, filtered.fresh) // healthy, not degraded
+
+        // Excluding everything means "unknown", never "dead" - and the caller
+        // judges deadness on the full universe for exactly that reason.
+        val allExcluded = cache.freshness(5_000L, now = now.get(), exclude = listOf("FROZEN", "LIVE"))
+        assertEquals(0, allExcluded.total)
+        assertFalse(allExcluded.feedDead)
+        assertFalse(cache.freshness(5_000L, now = now.get()).feedDead) // LIVE is fresh
+    }
+
+    @Test
+    fun `ageOf reports last update age and null for unknown or silent tickers`() {
+        val now = java.util.concurrent.atomic.AtomicLong(1_000L)
+        val cache = DepthCacheManager(clock = { now.get() })
+        cache.register(listOf("LIVE", "SILENT"))
+        cache.applySnapshot("LIVE", 4, mapOf(1.0 to 1.0), mapOf(2.0 to 1.0))
+        now.set(1_500L)
+        assertEquals(500L, cache.ageOf("LIVE"))
+        assertEquals(null, cache.ageOf("SILENT"))
+        assertEquals(null, cache.ageOf("NOT_WATCHED"))
+    }
+
+    @Test
     fun `pruneTo removes dead books but keeps live contexts intact`() {
         val cache = DepthCacheManager()
         cache.register(listOf("ETHBTC", "DEADUSDT"))

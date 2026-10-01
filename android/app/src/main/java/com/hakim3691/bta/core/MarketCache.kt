@@ -84,8 +84,15 @@ class MarketCache(
 
         for (symbolObj in trading) {
             val lotSize = symbolObj.filters.firstOrNull { it.filterType == "LOT_SIZE" }
-            val minQty = lotSize?.minQty ?: "1"
-            val dustDecimals = maxOf(minQty.indexOf('1') - 1, 0)
+            // The dust grid is the STEP the exchange quantises order quantities
+            // to, not the minimum quantity: a book with minQty 1 DOGE and
+            // stepSize 0.1 DOGE trades in tenths, and computing decimals from
+            // minQty produced 0 and silently rounded every fill to whole units.
+            // stepSize is preferred; minQty keeps the original behaviour for
+            // payloads (and test fixtures) that only carry it.
+            val stepDecimals = quantityDecimals(lotSize?.stepSize)
+            val dustDecimals = stepDecimals
+                ?: maxOf((lotSize?.minQty ?: "1").indexOf('1') - 1, 0)
             tradingSymbols[symbolObj.symbol] = symbolObj.copy(dustDecimals = dustDecimals)
         }
 
@@ -197,6 +204,24 @@ class MarketCache(
         if (executionTemplate[2] != "*" && executionTemplate[2] != ca.method) return null
 
         return Trade(ab, bc, ca, TradeSymbols(a, b, c))
+    }
+
+    /**
+     * Decimal places implied by an exchange quantity string ("0.10000000" ->
+     * 1). Null when the string is absent or carries no fractional part - "1",
+     * "10", "1000" mean whole-unit quantisation, which is also what the
+     * original's minQty fallback computes for them.
+     */
+    private fun quantityDecimals(qty: String?): Int? {
+        if (qty.isNullOrEmpty()) return null
+        val dot = qty.indexOf('.')
+        if (dot < 0) return null
+        val fraction = qty.substring(dot + 1)
+        // Decimal places = position of the last significant digit after the
+        // point; trailing zeros beyond it are display padding.
+        val significant = fraction.trimEnd('0')
+        if (significant.isEmpty()) return null
+        return significant.length
     }
 
     /**

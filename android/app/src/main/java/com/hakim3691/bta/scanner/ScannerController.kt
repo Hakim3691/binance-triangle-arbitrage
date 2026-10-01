@@ -118,6 +118,14 @@ class ScannerController(
          * at all, for hours, in every run.
          */
         const val PROBE_WINDOW_MS = 45_000L
+
+        /**
+         * Phase 2b: a book silent this long at runtime is quarantined the same
+         * way the startup probe excludes never-synced books. The watchdog runs
+         * every 30s, so detection latency is 30-90s. Deliberately far above the
+         * quiet-book tolerance for the same reason the probe window is.
+         */
+        const val STALE_TICKER_GRACE_MS = 120_000L
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -421,6 +429,16 @@ class ScannerController(
     private var statusJob: Job? = null
     private var syncJob: Job? = null
     private var wsCountJob: Job? = null
+
+    /** Phase 2b: quarantine/revival watchdog loop. */
+    private var quarantineJob: Job? = null
+
+    /**
+     * Phase 2b: tickers currently excluded by the runtime staleness monitor.
+     * Distinct from the probe's one-shot dead set: this population can shrink
+     * again when a book revives, so each change rebuilds the universe.
+     */
+    private val quarantinedTickers = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private var initializedAt = 0L
 
     /** Full exchangeInfo snapshot for the session; the dead-book probe re-filters it. */
@@ -477,7 +495,25 @@ class ScannerController(
             ensureResearchRecorder()
             LogRepository.info("main", "Checking latency ...")
 
-            val (apiKey, apiSecret) = credentialProvider()
+            // Credentials are resolved OUTSIDE the keystore path so a broken
+            // EncryptedSharedPreferences instance (the documented failure mode
+            // after a process is frozen and discarded in the background) cannot
+            // block a PAPER session: the simulator needs no keys at all. This
+            // used to be the first statement inside the try, so the only thing
+            // the user ever saw after reopening the app was ERROR with
+            // WEBSOCKET DISCONNECTED / REST DOWN and a 0 ms latency - the
+            // failure happened before the first REST call was ever made.
+            val credentials = runCatching { credentialProvider() }
+                .onFailure {
+                    LogRepository.warn(
+                        "main",
+                        "Secure credential store unavailable (${it.javaClass.simpleName}); " +
+                            "continuing without API keys - paper mode works, live trading and " +
+                            "the account fee rate do not"
+                    )
+                }
+                .getOrDefault("" to "")
+            val (apiKey, apiSecret) = credentials
             val rest = BinanceRestClient(http, { apiKey }, { apiSecret })
             restClient = rest
 
@@ -607,6 +643,10 @@ class ScannerController(
 
             _state.value = ScannerState.WAITING_FOR_DEPTH
 
+            // Real account fee rate (Phase 4c), replacing the 0.10% guess when
+            // keys exist. One weight-1 signed call; gracefully skipped without.
+            fetchRealFeeRate(rest)
+
             // Dead-book probe (Phase 2a). The initial snapshots are in flight,
             // so the next ~minute tells us which tickers the exchange actually
             // streams for. Anything that never produces a single update is a
@@ -649,6 +689,25 @@ class ScannerController(
                     delay(2_000)
                     refreshFeedHealth()
                     expireStaleArms()
+                }
+            }
+
+            // Phase 2b watchdog: a book that went silent at runtime joins the
+            // same exclusion as the startup probe's dead books, and a revived
+            // book re-enters the counts automatically. Bookkeeping only - no
+            // resubscription - so it is cheap enough to run often.
+            quarantineJob = scope.launch {
+                while (isActive) {
+                    delay(30_000)
+                    if (!stopRequested && _state.value == ScannerState.RUNNING) {
+                        runCatching { quarantineAndRecheckStaleTickers() }
+                            .onFailure {
+                                LogRepository.error(
+                                    "universe",
+                                    "Staleness watchdog failed: " + LogRepository.stackTrace(it)
+                                )
+                            }
+                    }
                 }
             }
 
@@ -705,6 +764,113 @@ class ScannerController(
                     " | " + LogRepository.stackTrace(e)
             )
             return
+        }
+    }
+
+    /**
+     * Phase 4c: the fee the projections actually deserve.
+     *
+     * exchangeInfo publishes no commission, so the scanner previously ran on a
+     * 0.10% guess. With API keys present, GET /sapi/v1/asset/tradeFee returns
+     * the account's real taker rate - including the BNB-discount 0.075% that
+     * materially changes whether a marginal edge survives three legs. Keys are
+     * optional: without them the configured fallback stays and the skip is
+     * logged once.
+     */
+    private suspend fun fetchRealFeeRate(rest: BinanceRestClient) {
+        try {
+            val rate = rest.accountTakerCommission()
+            if (rate == null) {
+                LogRepository.info(
+                    "settings",
+                    "Fee rate: no API key or no tradeFee row; keeping ${ExecutionConfig.feePercent}% fallback"
+                )
+                return
+            }
+            val percent = rate * 100.0
+            if (percent > 0.0) {
+                val previous = ExecutionConfig.feePercent
+                if (!ExecutionConfig.feeAuto) {
+                    LogRepository.info(
+                        "settings",
+                        "Fee rate ${percent}% fetched but fee is MANUAL; keeping ${previous}%"
+                    )
+                    return
+                }
+                ExecutionConfig.feePercent = percent
+                LogRepository.info(
+                    "settings",
+                    "Fee rate from account: ${percent}% taker (was ${previous}% fallback)"
+                )
+            }
+        } catch (e: Exception) {
+            LogRepository.info(
+                "settings",
+                "Fee rate unavailable: ${e.javaClass.simpleName}: ${e.message}; keeping " +
+                    "${ExecutionConfig.feePercent}% fallback"
+            )
+        }
+    }
+
+    /**
+     * Phase 2b: runtime staleness quarantine.
+     *
+     * The startup probe (Phase 2a) classifies books once, from the
+     * never-produced-a-snapshot signal. It cannot see a book that streamed
+     * normally for an hour and then went silent - and a silently frozen book is
+     * worse than a dead one, because isSynced stays true and the freshness gate
+     * alone would either halt the whole scan (feedDead) or drag the banner to
+     * DEGRADED forever.
+     *
+     * Quarantine is therefore bookkeeping-level: a long-silent book is excluded
+     * from the freshness counts and flagged, but its feed subscription and
+     * depth cache stay alive - so revival is directly observable (ageOf drops
+     * back under the gate the moment its shard reconnects and resnapshots) and
+     * re-admission is automatic. Rebuilding the universe here instead would
+     * prune the very context that proves the book came back.
+     *
+     * Books are only quarantined once their cadence has been learned, and never
+     * when their own median gap excuses them - quiet markets are slow, not
+     * broken, and they are exactly where dislocations live.
+     */
+    private fun quarantineAndRecheckStaleTickers() {
+        // After a feed resync the cadence map is deliberately reset; give the
+        // universe a few seconds to re-record arrival gaps before classifying.
+        if (cadence.tickers() < 5) return
+        val maxAge = ExecutionConfig.ageThresholdMs.toLong()
+        val now = System.currentTimeMillis()
+        val frozen = depthCache.getTickersWithoutRecentUpdate(STALE_TICKER_GRACE_MS, now)
+            .filter { ticker ->
+                // A never-seen ticker (no cadence) is the startup probe's
+                // population, not this monitor's; a quiet-but-alive book ticks
+                // slower than the gate by nature and is excused per-leg.
+                val gap = cadence.interArrivalMs(ticker)
+                gap > 0.0 && gap * QUIET_BOOK_TOLERANCE < maxAge
+            }
+        val newlyQuarantined = frozen.filter { it !in quarantinedTickers }
+        if (newlyQuarantined.isNotEmpty()) {
+            newlyQuarantined.forEach { quarantinedTickers.add(it) }
+            val sample = newlyQuarantined.sorted().take(20).joinToString(",")
+            LogRepository.warn(
+                "universe",
+                "Quarantined ${newlyQuarantined.size} silent tickers (no update in " +
+                    "${STALE_TICKER_GRACE_MS / 1000}s): [$sample]"
+            )
+        }
+        // Re-admission: a quarantined ticker that produced a fresh update is
+        // alive again - its shard reconnected and resnapshotted. It rejoins the
+        // freshness counts and its triangles resume being priced.
+        if (quarantinedTickers.isNotEmpty()) {
+            val revived = quarantinedTickers.filter { ticker ->
+                depthCache.ageOf(ticker, now)?.let { it <= maxAge } == true
+            }
+            if (revived.isNotEmpty()) {
+                quarantinedTickers.removeAll(revived.toSet())
+                LogRepository.info(
+                    "universe",
+                    "Re-admitted ${revived.size} revived tickers: ${revived.sorted().take(20)}"
+                )
+            }
         }
     }
 
@@ -1756,8 +1922,16 @@ class ScannerController(
         // slower than the gate - illiquid pairs, quiet markets - so "any stale
         // ticker" would suspend the scanner forever on a healthy universe.
         val maxAge = ExecutionConfig.ageThresholdMs.toLong()
-        val f = depthCache.freshness(maxAge)
-        feedStale = f.feedDead
+        // Deadness is judged on the FULL universe: quarantined books are
+        // excluded from the display counts below, but if every book in the
+        // universe is frozen that is still a dead feed - excluding them here
+        // would turn "everything stale" into "total 0, unknown" and the
+        // scanner would keep burning cycles on frozen books.
+        feedStale = depthCache.freshness(maxAge).feedDead
+        // Quarantined books are left out of the counts entirely: they are
+        // subscribed-but-frozen, and counting them re-created the permanent
+        // DEGRADED banner this monitor exists to remove.
+        val f = depthCache.freshness(maxAge, exclude = quarantinedTickers)
 
         // A pair that ticks slower than the global gate is illiquid, not
         // broken. The scan filter already excuses those per ticker, so the
@@ -1798,6 +1972,16 @@ class ScannerController(
         if (_state.value == ScannerState.PAUSED_CAP_REACHED) _state.value = ScannerState.RUNNING
     }
 
+    /**
+     * Fire-and-forget start for non-coroutine callers (the foreground service
+     * restoring a killed session). Idempotent: [start] itself refuses a second
+     * run, and any failure lands in the controller's own ERROR state rather
+     * than vanishing into a detached job.
+     */
+    fun requestStart() {
+        scope.launch { start() }
+    }
+
     fun stop() {
         stopRequested = true
         updateJob?.cancel()
@@ -1807,6 +1991,7 @@ class ScannerController(
         syncJob?.cancel()
         wsCountJob?.cancel()
         stalenessJob?.cancel()
+        quarantineJob?.cancel()
         wsClient?.close()
         // A short session used to produce no summary row at all, because the
         // interval had not elapsed when the scanner stopped. The partial
@@ -1818,6 +2003,12 @@ class ScannerController(
         cadence.reset()
         microstructureSamples.reset()
         publishArming()
+        // A clean stop is a new session: the runtime quarantine is wiped so the
+        // next start re-probes from scratch, exactly like the startup probe.
+        quarantinedTickers.clear()
+        // A clean stop is a new session: the runtime quarantine is wiped so the
+        // next start re-probes from scratch, exactly like the startup probe.
+        quarantinedTickers.clear()
         _state.value = ScannerState.STOPPED
         appContext?.let { ScannerForegroundService.stop(it) }
         LogRepository.info("main", "Scanner stopped")

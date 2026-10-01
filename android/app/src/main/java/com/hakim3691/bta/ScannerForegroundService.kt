@@ -39,11 +39,35 @@ class ScannerForegroundService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
-        // Not START_STICKY: if the system does kill us, a restart without the
-        // scanner state would show a dead process wearing a running badge. The
-        // UI already reflects the real scanner state, so a silent no-op restart
-        // would be a lie.
-        return START_NOT_STICKY
+        // Phase 5: START_REDELIVERED_INTENT with an explicit state restore.
+        // The service is the only process-lifetime anchor this app has, so it
+        // is also the only place that knows "the OS restarted me" - which
+        // means the scanner the user left running was killed with it. The
+        // restore is idempotent (start() refuses a second run), a deliberate
+        // stop clears the service so nothing is redelivered, and if the
+        // restarted process cannot reach Binance the controller surfaces its
+        // own failure state instead of a dead process wearing a running badge.
+        if (intent != null) {
+            restoreRunningState(this)
+        }
+        return Service.START_REDELIVER_INTENT
+    }
+
+    /**
+     * Re-launches the scanner if the application was restarted underneath it.
+     * Called from [onStartCommand] when the system redelivered a start intent,
+     * i.e. the process died while a scan session was live.
+     */
+    private fun restoreRunningState(context: Context) {
+        val app = context.applicationContext as? ArbApplication ?: return
+        val controller = app.scannerController
+        if (controller.state.value != com.hakim3691.bta.scanner.ScannerState.STOPPED) return
+        android.util.Log.i(TAG, "Process restored by the system; resuming the scan session")
+        com.hakim3691.bta.log.LogRepository.warn(
+            "main",
+            "Process was killed in the background - resuming the scan session"
+        )
+        controller.requestStart()
     }
 
     private fun buildNotification(): Notification {
@@ -70,6 +94,7 @@ class ScannerForegroundService : Service() {
     companion object {
         private const val CHANNEL_ID = "scanner_service"
         private const val NOTIFICATION_ID = 0xB7A
+        private const val TAG = "ScannerForegroundService"
 
         /** Idempotently promotes the process to a foreground service. */
         fun start(context: Context) {

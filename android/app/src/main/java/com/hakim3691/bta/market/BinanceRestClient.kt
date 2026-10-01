@@ -303,6 +303,44 @@ class BinanceRestClient(
     }
 
     // ------------------------------------------------------------------
+    // GET /sapi/v1/asset/tradeFee (signed) - the account's real commission
+    // ------------------------------------------------------------------
+
+    /**
+     * The spot account's effective taker commission as a fraction of notional
+     * (0.001 == 0.10%), or null when no API key is configured or no row
+     * covers the symbol. This is the rate the profit projections deserve:
+     * exchangeInfo publishes no commission, so without it the engine can only
+     * guess - and the BNB-discount 0.075% vs the flat 0.10% guess is exactly
+     * the margin a marginal triangle lives or dies on.
+     */
+    suspend fun accountTakerCommission(symbol: String = "BTCUSDT"): Double? {
+        if (apiKeyProvider().isBlank() || apiSecretProvider().isBlank()) return null
+        val canonical = buildString {
+            append("symbol=").append(symbol)
+            append("&timestamp=").append(signedTimestamp())
+            append("&recvWindow=5000")
+        }
+        val signature = hmacSha256(apiSecretProvider(), canonical)
+        val url = "$BASE_URL/sapi/v1/asset/tradeFee?$canonical&signature=$signature"
+        val request = Request.Builder().url(url).header("X-MBX-APIKEY", apiKeyProvider()).build()
+        http.newCall(request).execute().use { resp ->
+            val bodyText = resp.body?.string() ?: return null
+            if (!resp.isSuccessful) return null
+            val obj = runCatching { json.parseToJsonElement(bodyText).jsonObject }.getOrNull()
+                ?: return null
+            val rows = obj["tradeFee"]?.jsonArray ?: return null
+            for (row in rows) {
+                val ro = row.jsonObject
+                if (ro["symbol"]?.jsonPrimitive?.content == symbol) {
+                    return ro["takerCommission"]?.jsonPrimitive?.content?.toDoubleOrNull()
+                }
+            }
+            return null
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Internal request helper
     // ------------------------------------------------------------------
 

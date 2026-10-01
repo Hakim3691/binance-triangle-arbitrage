@@ -58,6 +58,9 @@ class KellyPaperTrader(
     private val stranded = ConcurrentHashMap<String, Double>()
     private var lastPWin: Double? = null
 
+    /** Phase 4b: routes settlement and funding through the live pair graph. */
+    private val router = AssetRouter(paperEngine)
+
     val stats: Stats get() = snapshotStats()
 
     /**
@@ -213,8 +216,11 @@ class KellyPaperTrader(
 
                     val earnedBase = state.actual?.a?.earned ?: 0.0
 
-                    // 4) Settle: base -> USDT
-                    val settledUsdt = settleBase(base, earnedBase) ?: 0.0
+                    // 4) Settle: base -> USDT, routed through the pair graph when
+                    // no direct book exists (Phase 4b).
+                    val settledUsdt = if (earnedBase > 0.0) {
+                        router.convert(base, earnedBase, "USDT")
+                    } else 0.0
 
                     val pnl = settledUsdt - usdtSpent
                     val outcomePercent = if (usdtSpent > 0) pnl / usdtSpent * 100.0 else 0.0
@@ -240,29 +246,37 @@ class KellyPaperTrader(
     /** BUY base with USDT; returns (baseQtyReceived, usdtSpent) or null on failure. */
     private suspend fun fundBase(base: String, usdtAllocation: Double): Pair<Double, Double>? {
         val ticker = base + "USDT"
-        if (PaperTradingEngine.paperUniverse[ticker] == null) {
-            LogRepository.warn("kelly", "No $ticker market; cannot fund $base from USDT budget")
-            return null
+        if (PaperTradingEngine.paperUniverse[ticker] != null) {
+            val depth = paperEngine.getSortedDepth(ticker)
+            if (depth.asks.isEmpty()) return null
+            // Base quantity purchasable with usdtAllocation at the best ask (conservative pre-size;
+            // the engine walk refines the actual fill)
+            val bestAsk = depth.asks.keys.first()
+            val preSize = usdtAllocation / bestAsk
+            val response = paperEngine.placeMarketOrder(ticker, preSize, Relationship.BUY)
+            if (response.orderId == null || response.executedQty <= 0.0) {
+                LogRepository.warn("kelly", "Funding order failed on $ticker")
+                return null
+            }
+            return response.executedQty to response.cummulativeQuoteQty
         }
-        val depth = paperEngine.getSortedDepth(ticker)
-        if (depth.asks.isEmpty()) return null
-        // Base quantity purchasable with usdtAllocation at the best ask (conservative pre-size;
-        // the engine walk refines the actual fill)
-        val bestAsk = depth.asks.keys.first()
-        val preSize = usdtAllocation / bestAsk
-        val response = paperEngine.placeMarketOrder(ticker, preSize, Relationship.BUY)
-        if (response.orderId == null || response.executedQty <= 0.0) {
-            LogRepository.warn("kelly", "Funding order failed on $ticker")
-            return null
-        }
-        return response.executedQty to response.cummulativeQuoteQty
+        // Phase 4b: no direct USDT book - fund through the pair graph instead of
+        // giving up on every triangle rooted at an asset quoted elsewhere.
+        val bought = router.convert("USDT", usdtAllocation, base)
+        return if (bought > 0.0) bought to usdtAllocation else null
     }
 
     /** SELL base back to USDT; returns USDT received or null when no market. */
     private suspend fun settleBase(base: String, baseQty: Double): Double? {
         if (baseQty <= 0.0) return null
         val ticker = base + "USDT"
-        if (PaperTradingEngine.paperUniverse[ticker] == null) return null
+        if (PaperTradingEngine.paperUniverse[ticker] == null) {
+            // Phase 4b: route through intermediates instead of abandoning the
+            // settlement - the value the triangle just earned must not be
+            // stranded just because its asset has no USDT book.
+            val routed = router.convert(base, baseQty, "USDT")
+            return routed.takeIf { it > 0.0 }
+        }
         val response = paperEngine.placeMarketOrder(ticker, baseQty, Relationship.SELL)
         return if (response.orderId != null) response.cummulativeQuoteQty else null
     }
