@@ -168,7 +168,8 @@ s = re.sub(r'Version: [^\n]*(?:\n(?!#|\n)[^\n]*)*',
            'gradle.properties rather than derived from git, so every checkout of this\n'
            "commit produces the same version. The commit is reported separately under\n"
            'Connection -> Build.\n',
-           s, count=1)    s = re.sub(r'\(\d+/\d+ unit tests green\)', '(307/307 unit tests green)', s)
+           s, count=1)
+s = re.sub(r'\(\d+/\d+ unit tests green\)', '(307/307 unit tests green)', s)
 open(path, 'w', encoding='utf-8').write(s)
 print(f'    RESTORE.md updated -> {name} (code {code})')
 PY
