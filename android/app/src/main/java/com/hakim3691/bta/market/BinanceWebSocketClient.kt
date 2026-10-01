@@ -20,7 +20,6 @@ import okhttp3.Request
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
-import java.util.concurrent.TimeUnit
 
 enum class WsStatus { DISCONNECTED, CONNECTING, CONNECTED, RECONNECTING }
 
@@ -28,6 +27,13 @@ enum class WsStatus { DISCONNECTED, CONNECTING, CONNECTED, RECONNECTING }
  * Binance market WebSocket client for `<symbol>@depth@100ms` streams,
  * with staggered subscription initialization, reconnect with exponential
  * backoff, stale-connection watchdog, and malformed-message tolerance.
+ *
+ * The subscription set is sharded across as many sockets as it needs. Binance
+ * caps a combined stream at 1024 streams per connection, and the stream list
+ * travels in the URL, so a universe discovered from the whole exchange
+ * (every asset that roots a triangle) no longer fits on one socket. Sharding
+ * keeps each connection well inside both limits; the cache, the watchdog and
+ * the resync path treat the shards as one feed.
  */
 class BinanceWebSocketClient(
     private val http: OkHttpClient,
@@ -37,6 +43,7 @@ class BinanceWebSocketClient(
 
     companion object {
         const val WS_URL = "wss://stream.binance.com:9443/stream"
+
         /** Port of the Main.js valid-depth selection for REST snapshot limits. */
         fun resolveValidDepth(requested: Int): Int =
             BinanceRestClient.resolveValidDepth(requested)
@@ -49,6 +56,20 @@ class BinanceWebSocketClient(
 
         /** Binance's documented per-connection limit for combined streams. */
         const val MAX_COMBINED_STREAMS = 1024
+
+        /**
+         * Streams per socket. Under [MAX_COMBINED_STREAMS] because every stream
+         * name is embedded in the request URL (~22 chars each) and oversized
+         * request lines are rejected before Binance's own stream limit is
+         * reached. 500 streams is ~12 KB of URL, comfortably above the 325-stream
+         * subscription every earlier build ran on a single socket, and a
+         * whole-exchange universe fits in three sockets.
+         */
+        const val MAX_STREAMS_PER_SOCKET = 500
+
+        /** Splits a universe into per-socket subscription groups, order preserved. */
+        fun shard(symbols: List<String>): List<List<String>> =
+            symbols.chunked(MAX_STREAMS_PER_SOCKET)
     }
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -66,16 +87,32 @@ class BinanceWebSocketClient(
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError
 
-    private var webSocket: WebSocket? = null
+    /** One socket and the slice of the universe it carries. */
+    private class Shard(val symbols: List<String>) {
+        var socket: WebSocket? = null
+        var status: WsStatus = WsStatus.DISCONNECTED
+        var lastMessageAt: Long = 0L
+        var reconnectAttempts: Int = 0
+        var openCount: Int = 0
+        var reconnectJob: Job? = null
+        var resyncJob: Job? = null
+    }
+
+    private var shards: List<Shard> = emptyList()
     private var subscribedSymbols: List<String> = emptyList()
     private var watchdogJob: Job? = null
-    private var reconnectJob: Job? = null
-    private var resyncJob: Job? = null
-    private var reconnectAttempts = 0
     private var manualClose = false
 
+    /** How many times [connect] has been called; >1 means a re-subscription. */
+    private var connectCount = 0
+
+    /** Whether this connect generation has already reported the feed as up. */
+    private var generationNotified = false
+
     /**
-     * Invoked every time a socket opens, including after a reconnect.
+     * Invoked when the feed (re)establishes itself: once when every shard of a
+     * connect generation has opened, and again whenever a dropped shard comes
+     * back.
      *
      * The owner uses it to discard observations collected while the feed was
      * down. Ages recorded during an outage describe a disconnection, not the
@@ -83,68 +120,85 @@ class BinanceWebSocketClient(
      */
     var onResync: (() -> Unit)? = null
 
-    /** Number of times a socket has been opened; 1 means the initial connect. */
-    private var opens = 0
-
-    /** Opens the combined stream for the given symbols with staggered init. */
+    /** Opens the combined stream(s) for the given symbols. */
     fun connect(symbols: List<String>) {
         if (symbols.isEmpty()) return
         manualClose = false
         subscribedSymbols = symbols
+        closeSockets()
+        connectCount += 1
+        generationNotified = false
+        shards = shard(symbols).map { Shard(it) }
         _status.value = WsStatus.CONNECTING
-        openSocket()
+        for (s in shards) openSocket(s)
         startWatchdog()
     }
 
-    private fun openSocket() {
-        // Combined stream format: /stream?streams=a@depth@100ms/b@depth@100ms/...
-        // Binance caps a combined stream at 1024 streams per connection;
-        // URLs beyond that are rejected at handshake, so the failure must be
-        // loud and early rather than a mysterious disconnect.
-        check(subscribedSymbols.size <= MAX_COMBINED_STREAMS) {
-            "Combined stream would subscribe ${subscribedSymbols.size} tickers; " +
-                "Binance allows at most $MAX_COMBINED_STREAMS per connection"
-        }
+    private fun openSocket(shard: Shard) {
         // Binance caps a combined stream at 1024 streams per connection and
-        // rejects the handshake beyond that, so an oversized universe must
-        // fail loudly here rather than as a mysterious disconnect loop.
-        check(subscribedSymbols.size <= MAX_COMBINED_STREAMS) {
-            "Combined stream would subscribe ${subscribedSymbols.size} tickers; " +
+        // rejects the handshake beyond that, so an oversized shard must fail
+        // loudly here rather than as a mysterious disconnect loop.
+        check(shard.symbols.size <= MAX_COMBINED_STREAMS) {
+            "Combined stream would subscribe ${shard.symbols.size} tickers; " +
                 "Binance allows at most $MAX_COMBINED_STREAMS per connection"
         }
-        val streams = subscribedSymbols.joinToString("/") { "${it.lowercase()}@depth@100ms" }
+        val streams = shard.symbols.joinToString("/") { "${it.lowercase()}@depth@100ms" }
         val request = Request.Builder().url("$WS_URL?streams=$streams").build()
-        webSocket = http.newWebSocket(request, listener)
+        shard.socket = http.newWebSocket(request, listenerFor(shard))
     }
 
-    private val listener = object : WebSocketListener() {
+    private fun listenerFor(shard: Shard) = object : WebSocketListener() {
         override fun onOpen(webSocket: WebSocket, response: Response) {
-            reconnectAttempts = 0
-            _status.value = WsStatus.CONNECTED
+            shard.reconnectAttempts = 0
+            shard.openCount += 1
+            shard.status = WsStatus.CONNECTED
+            shard.lastMessageAt = System.currentTimeMillis()
             _lastError.value = null
-            opens++
-            onResync?.invoke()
-            // After an outage every cached ticker is potentially gapped, and a
-            // dead feed produces no diffs at all - so gap detection can never
-            // flag them and the cache would stay frozen indefinitely. Re-seed
-            // proactively instead of waiting for the watchdog sweep.
-            if (opens > 1) requestFullResync()
+            updateStatus()
+            if (shard.openCount > 1) {
+                // This shard dropped and came back: its books are gapped.
+                // Re-seed proactively instead of waiting for the watchdog.
+                requestFullResync(shard)
+                onResync?.invoke()
+            } else if (shards.all { it.openCount >= 1 } && !generationNotified) {
+                generationNotified = true
+                onResync?.invoke()
+            }
         }
 
         override fun onMessage(webSocket: WebSocket, text: String) {
+            shard.lastMessageAt = System.currentTimeMillis()
+            _lastMessageAt.value = shard.lastMessageAt
             _messagesReceived.value += 1
-            _lastMessageAt.value = System.currentTimeMillis()
             handleMessage(text)
         }
 
         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
             _lastError.value = t.message ?: "websocket failure"
-            scheduleReconnect()
+            scheduleReconnect(shard)
         }
 
         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-            if (!manualClose) scheduleReconnect()
-            else _status.value = WsStatus.DISCONNECTED
+            if (!manualClose) scheduleReconnect(shard)
+            else {
+                shard.status = WsStatus.DISCONNECTED
+                updateStatus()
+            }
+        }
+    }
+
+    /** Aggregate status: the feed is only CONNECTED when every shard is. */
+    private fun updateStatus() {
+        val states = shards.map { it.status }
+        _status.value = when {
+            states.isEmpty() -> WsStatus.DISCONNECTED
+            states.all { it == WsStatus.CONNECTED } -> WsStatus.CONNECTED
+            states.any { it == WsStatus.RECONNECTING } -> WsStatus.RECONNECTING
+            states.any { it == WsStatus.CONNECTING } -> WsStatus.CONNECTING
+            states.all { it == WsStatus.DISCONNECTED } -> WsStatus.DISCONNECTED
+            // Mixed live/closed without a scheduled retry is transient; the
+            // closed shard schedules its own reconnect on the way out.
+            else -> WsStatus.RECONNECTING
         }
     }
 
@@ -181,36 +235,42 @@ class BinanceWebSocketClient(
         }
     }
 
-    private fun scheduleReconnect() {
-        if (manualClose || _status.value == WsStatus.RECONNECTING) return
-        _status.value = WsStatus.RECONNECTING
-        reconnectJob = scope.launch {
+    private fun scheduleReconnect(shard: Shard) {
+        if (manualClose || shard.status == WsStatus.RECONNECTING) return
+        shard.status = WsStatus.RECONNECTING
+        updateStatus()
+        shard.reconnectJob = scope.launch {
             // Exponential backoff capped at 30s
-            val backoffMs = (1000L shl reconnectAttempts.coerceAtMost(5))
-            reconnectAttempts += 1
+            val backoffMs = (1000L shl shard.reconnectAttempts.coerceAtMost(5))
+            shard.reconnectAttempts += 1
             delay(backoffMs)
-            if (!manualClose) {
-                openSocket()
-            }
+            if (!manualClose) openSocket(shard)
         }
     }
 
     /**
-     * Stale-connection watchdog: if no message arrives within 15s, force
-     * reconnect. Binance pushes depth for active symbols far more often than
-     * that; quietness implies a dead connection.
+     * Stale-connection watchdog: if a shard receives no message within 15s,
+     * force that shard to reconnect. Binance pushes depth for active symbols
+     * far more often than that; quietness implies a dead connection. A silent
+     * shard whose symbols are all permanently quiet produces no messages at
+     * all - the dead-book probe removes those tickers from the universe, so
+     * "silent shard" stays a connection-level signal.
      */
     private fun startWatchdog() {
         watchdogJob?.cancel()
         watchdogJob = scope.launch {
             while (isActive && !manualClose) {
                 delay(5000)
-                val last = _lastMessageAt.value
-                val connected = _status.value == WsStatus.CONNECTED
-                if (connected && last != 0L && System.currentTimeMillis() - last > 15_000) {
-                    _lastError.value = "stale connection detected (no messages for 15s)"
-                    webSocket?.cancel()
-                    scheduleReconnect()
+                val now = System.currentTimeMillis()
+                for (shard in shards) {
+                    val last = shard.lastMessageAt
+                    if (shard.status == WsStatus.CONNECTED && last != 0L &&
+                        now - last > 15_000
+                    ) {
+                        _lastError.value = "stale connection detected (no messages for 15s)"
+                        shard.socket?.cancel()
+                        scheduleReconnect(shard)
+                    }
                 }
                 // Request fresh snapshots for symbols flagged out-of-sync
                 val resync = depthCache.takeOutOfSyncSymbols()
@@ -222,17 +282,13 @@ class BinanceWebSocketClient(
     }
 
     /**
-     * Fetches a REST depth snapshot for a symbol and applies it to the cache.
-     * Port of the library's getSymbolDepthSnapshot + updateSymbolDepthCache.
-     */
-    /**
-     * Re-seeds every watched ticker with a fresh REST snapshot, in batches so a
+     * Re-seeds one shard's tickers with fresh REST snapshots, in batches so a
      * reconnect does not fire hundreds of simultaneous requests.
      */
-    private fun requestFullResync() {
-        resyncJob?.cancel()
-        resyncJob = scope.launch {
-            for (batch in subscribedSymbols.chunked(RESYNC_BATCH_SIZE)) {
+    private fun requestFullResync(shard: Shard) {
+        shard.resyncJob?.cancel()
+        shard.resyncJob = scope.launch {
+            for (batch in shard.symbols.chunked(RESYNC_BATCH_SIZE)) {
                 if (manualClose) return@launch
                 batch.forEach { requestSnapshot(it) }
                 delay(RESYNC_BATCH_DELAY_MS)
@@ -258,12 +314,20 @@ class BinanceWebSocketClient(
         }
     }
 
+    private fun closeSockets() {
+        for (shard in shards) {
+            shard.reconnectJob?.cancel()
+            shard.resyncJob?.cancel()
+            shard.socket?.close(1000, "resubscribe")
+            shard.status = WsStatus.DISCONNECTED
+        }
+    }
+
     fun close() {
         manualClose = true
         watchdogJob?.cancel()
-        reconnectJob?.cancel()
-        resyncJob?.cancel()
-        webSocket?.close(1000, "client shutdown")
+        closeSockets()
+        shards = emptyList()
         _status.value = WsStatus.DISCONNECTED
     }
 }

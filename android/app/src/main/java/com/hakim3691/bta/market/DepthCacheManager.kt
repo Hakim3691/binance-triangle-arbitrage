@@ -290,6 +290,22 @@ class DepthCacheManager(
             .filter { it.value.localEventTime == 0L || now - it.value.localEventTime > maxAgeMs }
             .map { it.key }
 
+    /**
+     * Drops every context that is not in [tickers].
+     *
+     * Used by the dead-book probe: books that never produced a single update
+     * are removed from the cache entirely so they cannot reappear in freshness
+     * counts, sync progress, or the degraded-feed banner - the universe shrinks
+     * rather than carrying permanent noise.
+     */
+    @Synchronized
+    fun pruneTo(tickers: Collection<String>) {
+        val keep = tickers.toSet()
+        contexts.keys.retainAll(keep)
+        outOfSyncSymbols.retainAll(keep)
+        _syncedCount.value = syncedTickers()
+    }
+
     fun clear() {
         contexts.clear()
         outOfSyncSymbols.clear()

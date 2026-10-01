@@ -196,4 +196,69 @@ class MarketCacheTest {
         assertTrue(bases.contains("BTC"))
         assertTrue(bases.contains("USDT"))
     }
+
+    // ------------------------------------------------------------------
+    // Phase 1: graph-based discovery over every asset the exchange lists
+    // ------------------------------------------------------------------
+
+    @Test
+    fun `an empty base restriction discovers the whole market`() {
+        ExecutionConfig.dedupeMirroredTriangles = false
+        val result = MarketCache().initialize(symbols(), emptySet())
+
+        // Fixture graph: ETH-BNB-BTC, ETH-BTC-USDT and LTC-BTC-USDT are the
+        // only fully connected triples. Three undirected triangles, three roots
+        // each, two directions each = 18 traversals.
+        assertEquals(18, result.trades.size)
+        assertEquals(setOf("BTC", "ETH", "BNB", "USDT", "LTC"), result.bases)
+        // BTC roots the most triangles (all three), so it is the reference book.
+        assertEquals("BTC", result.referenceBase)
+    }
+
+    @Test
+    fun `the restricted universe is a subset of the full market`() {
+        ExecutionConfig.dedupeMirroredTriangles = false
+        val btcOnly = MarketCache().initialize(symbols(), setOf("BTC")).trades.map { it.id }.toSet()
+        val full = MarketCache().initialize(symbols(), emptySet()).trades.map { it.id }.toSet()
+
+        assertTrue(btcOnly.isNotEmpty())
+        assertTrue(full.containsAll(btcOnly))
+        // And the newly reachable roots really are new traversals, not renames:
+        // the same three books can be round-tripped from any asset you hold.
+        assertTrue("ETH-BNB-BTC" in full)
+        assertTrue("USDT-LTC-BTC" in full)
+    }
+
+    @Test
+    fun `rotations of one triangle cross the same books`() {
+        // Rooting the same cycle at a different asset is the same three books
+        // in the same rotational order - the market edge is identical; only the
+        // starting asset (and therefore the sizing unit) differs.
+        val result = MarketCache().initialize(symbols(), emptySet())
+        val rotations = result.trades
+            .filter { setOf(it.symbol.a, it.symbol.b, it.symbol.c) == setOf("BTC", "ETH", "BNB") }
+            .map { it.id }
+        assertEquals(setOf("BTC-ETH-BNB", "BTC-BNB-ETH", "ETH-BTC-BNB", "ETH-BNB-BTC", "BNB-BTC-ETH", "BNB-ETH-BTC"), rotations.toSet())
+        val legSets = result.trades
+            .filter { setOf(it.symbol.a, it.symbol.b, it.symbol.c) == setOf("BTC", "ETH", "BNB") }
+            .map { listOf(it.ab.ticker, it.bc.ticker, it.ca.ticker).sorted() }
+            .toSet()
+        // Every rotation and both directions traverse exactly the same three markets.
+        assertEquals(1, legSets.size)
+    }
+
+    @Test
+    fun `mirror de-duplication halves the full market and counts what it dropped`() {
+        ExecutionConfig.dedupeMirroredTriangles = false
+        val full = MarketCache().initialize(symbols(), emptySet())
+
+        ExecutionConfig.dedupeMirroredTriangles = true
+        val dedupedCache = MarketCache()
+        val deduped = dedupedCache.initialize(symbols(), emptySet())
+        ExecutionConfig.dedupeMirroredTriangles = false
+
+        // Each kept traversal has exactly one mirror, so the count must be exact.
+        assertEquals(full.trades.size, deduped.trades.size * 2)
+        assertEquals(full.trades.size, deduped.trades.size + dedupedCache.resultMirrorsSkipped)
+    }
 }

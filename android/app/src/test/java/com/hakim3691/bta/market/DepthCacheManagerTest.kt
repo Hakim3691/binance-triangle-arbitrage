@@ -26,6 +26,28 @@ class DepthCacheManagerTest {
     ) = DepthCacheManager.DiffEvent(symbol, U, u, E, bids, asks)
 
     @Test
+    fun `pruneTo removes dead books but keeps live contexts intact`() {
+        val cache = DepthCacheManager()
+        cache.register(listOf("ETHBTC", "DEADUSDT"))
+        cache.applySnapshot("ETHBTC", 4, mapOf(99.0 to 5.0), mapOf(102.0 to 3.0))
+        cache.markOutOfSync("DEADUSDT")
+        assertEquals(1, cache.syncedTickers())
+
+        cache.pruneTo(listOf("ETHBTC"))
+
+        // The dead book is gone entirely: no context, no out-of-sync flag, and
+        // it can no longer appear in freshness counts or the degraded banner.
+        assertEquals(null, cache.getRawDepth("DEADUSDT"))
+        assertEquals(listOf("ETHBTC"), cache.watching())
+        assertEquals(1, cache.syncedTickers())
+        assertFalse(cache.takeOutOfSyncSymbols().contains("DEADUSDT"))
+        // The surviving context kept its book and its synced state.
+        val snap = cache.getSortedSnapshot("ETHBTC")!!
+        assertTrue(snap.bids.containsKey(99.0))
+        assertTrue(cache.isSynced("ETHBTC"))
+    }
+
+    @Test
     fun `diffs before snapshot are queued then replayed`() {
         val cache = DepthCacheManager()
         cache.register(listOf("ETHBTC"))

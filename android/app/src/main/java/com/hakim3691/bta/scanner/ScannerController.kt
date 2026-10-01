@@ -19,6 +19,7 @@ import com.hakim3691.bta.core.ExecutionState
 import com.hakim3691.bta.core.CalculatedPosition
 import com.hakim3691.bta.core.InvestmentSpec
 import com.hakim3691.bta.core.MarketCache
+import com.hakim3691.bta.core.SymbolInfo
 import com.hakim3691.bta.core.OrderResponse
 import com.hakim3691.bta.core.TradeExecutor
 import com.hakim3691.bta.core.Trade
@@ -102,6 +103,21 @@ class ScannerController(
          * the trades that happened to be profitable.
          */
         const val SAMPLES_PER_CYCLE = 3
+
+        /**
+         * Dead-book probe: how long to wait for every ticker's initial REST
+         * snapshot before giving up and probing with whatever synced.
+         */
+        const val PROBE_DEADLINE_MS = 60_000L
+
+        /**
+         * Dead-book probe: a ticker that produces no book update for this long
+         * after its snapshot is excluded for the session. Deliberately far
+         * longer than the quiet-book tolerance so a genuinely slow market is
+         * not mistaken for a delisted one - the books this removes never tick
+         * at all, for hours, in every run.
+         */
+        const val PROBE_WINDOW_MS = 45_000L
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -407,6 +423,42 @@ class ScannerController(
     private var wsCountJob: Job? = null
     private var initializedAt = 0L
 
+    /** Full exchangeInfo snapshot for the session; the dead-book probe re-filters it. */
+    private var exchangeSymbols: List<SymbolInfo> = emptyList()
+
+    /** Guards the startup probe against a stop() landing mid-window. */
+    @Volatile private var stopRequested = false
+
+    /**
+     * Feed-resync handling shared by the initial connect and any
+     * re-subscription after the dead-book rebuild: a reconnect proves the
+     * books we were pricing against are gone, so drop everything the tuner
+     * learned while the feed was down.
+     */
+    private val feedResyncHandler: () -> Unit = {
+        ageTuner.reset()
+        cadence.reset()
+        if (initialSyncComplete) {
+            // Only a genuine recovery is worth a WARN. Resyncs also
+            // happen on the initial snapshot and on routine REST
+            // re-fetches, and calling those a recovery cried wolf on
+            // every single start.
+            if (sawDegradedFeed) {
+                LogRepository.warn(
+                    "binance",
+                    "Feed recovered - age gate re-learning from fresh books"
+                )
+            } else {
+                LogRepository.debug("binance", "Books resynced - feed still healthy")
+            }
+        } else {
+            LogRepository.info("binance", "Initial depth snapshot synced")
+            initialSyncComplete = true
+        }
+        sawDegradedFeed = false
+        refreshFeedHealth()
+    }
+
     // ------------------------------------------------------------------
     // Start / stop
     // ------------------------------------------------------------------
@@ -415,6 +467,7 @@ class ScannerController(
         if (_state.value == ScannerState.RUNNING || _state.value == ScannerState.INITIALIZING) return
         try {
             _state.value = ScannerState.INITIALIZING
+            stopRequested = false
             // Attach CSV collection before anything can record. This call was
             // missing entirely, so researchRecorder stayed null for the whole
             // session and every recorder guarded by `?: return` dropped its rows
@@ -457,14 +510,23 @@ class ScannerController(
 
             LogRepository.info("main", "Fetching exchange info ...")
             val symbols = rest.exchangeInfo()
-            val bases = InvestmentSpec.DEFAULTS.keys
+            exchangeSymbols = symbols
             marketCache = MarketCache(whitelist = emptySet(), executionTemplate = listOf("*", "*", "*"))
-            val result = marketCache.initialize(symbols, bases)
+            // The universe is discovered from the live pair graph, not from a
+            // configured base: passing an empty restriction means every asset
+            // the exchange lists can root a triangle. The old code passed the
+            // Settings base here, which is why every opportunity the scanner
+            // ever reported started and ended with BTC regardless of market.
+            val result = marketCache.initialize(symbols, emptySet())
             LogRepository.info(
                 "main",
                 "Found ${result.tradingSymbolCount}/${result.totalSymbolCountFound} currently trading tickers"
             )
-            LogRepository.info("main", "Found ${result.trades.size} triangular trades")
+            LogRepository.info(
+                "main",
+                "Found ${result.trades.size} triangular trades across " +
+                    "${result.bases.size} base assets (largest: ${result.referenceBase})"
+            )
             if (marketCache.resultMirrorsSkipped > 0) {
                 LogRepository.info(
                     "main",
@@ -498,7 +560,7 @@ class ScannerController(
             // executor would be tuning itself against a fiction.
             paperEngine = PaperTradingEngine(
                 depthProvider = { ticker -> depthCache.getSortedSnapshot(ticker, ExecutionConfig.scanningDepth) },
-                startingBalance = defaultPaperBalance(bases),
+                startingBalance = defaultPaperBalance(result.bases),
                 latencyMs = ExecutionConfig.paperLatencyMs.toLong(),
                 slippagePercent = ExecutionConfig.paperSlippagePercent
             )
@@ -526,31 +588,7 @@ class ScannerController(
             // Open websocket and fetch snapshots (staggered init equivalent: fetch in batches)
             val validDepth = BinanceWebSocketClient.resolveValidDepth(ExecutionConfig.scanningDepth)
             wsClient = BinanceWebSocketClient(http, depthCache, validDepth)
-            // A reconnect proves the books we were pricing against are gone;
-            // drop everything the tuner learned while the feed was down.
-            wsClient!!.onResync = {
-                ageTuner.reset()
-                cadence.reset()
-                if (initialSyncComplete) {
-                    // Only a genuine recovery is worth a WARN. Resyncs also
-                    // happen on the initial snapshot and on routine REST
-                    // re-fetches, and calling those a recovery cried wolf on
-                    // every single start.
-                    if (sawDegradedFeed) {
-                        LogRepository.warn(
-                            "binance",
-                            "Feed recovered - age gate re-learning from fresh books"
-                        )
-                    } else {
-                        LogRepository.debug("binance", "Books resynced - feed still healthy")
-                    }
-                } else {
-                    LogRepository.info("binance", "Initial depth snapshot synced")
-                    initialSyncComplete = true
-                }
-                sawDegradedFeed = false
-                refreshFeedHealth()
-            }
+            wsClient!!.onResync = feedResyncHandler
             _connection.value = _connection.value.copy(
                 totalTickers = result.watching.size,
                 syncedTickers = 0
@@ -568,7 +606,18 @@ class ScannerController(
             }
 
             _state.value = ScannerState.WAITING_FOR_DEPTH
-            LogRepository.info("main", "Waiting for all tickers to receive initial depth snapshot ...")
+
+            // Dead-book probe (Phase 2a). The initial snapshots are in flight,
+            // so the next ~minute tells us which tickers the exchange actually
+            // streams for. Anything that never produces a single update is a
+            // permanently dead book - every triangle through it would be
+            // skipped as stale on every cycle for the whole session, padding
+            // the universe, the idle count and the degraded-feed banner with
+            // markets that cannot be traded. Excluded once, here, and never
+            // revisited: the universe is rebuilt without them before the first
+            // scan cycle runs.
+            probeAndPrune()
+            if (stopRequested) return
 
             // Subscribe to depth updates -> run arbitrage cycle (port of arbitrageCycleCallback)
             updateJob = scope.launch {
@@ -657,6 +706,237 @@ class ScannerController(
             )
             return
         }
+    }
+
+    /**
+     * Phase 2a: dead-book probe.
+     *
+     * Runs once, between the initial snapshot fetch and the first scan cycle.
+     * A ticker is declared dead when it has produced no book update for
+     * [PROBE_WINDOW_MS] after its snapshot landed - which is exactly the
+     * population that made every previous session log
+     * "Tickers without recent depth cache update" for the entire run while
+     * their triangles were skipped as stale on every single cycle.
+     *
+     * A quiet-but-live book (one that updates rarely) is not dead: it ticks at
+     * least once inside the window and survives. Only books the exchange
+     * simply does not stream for are removed.
+     */
+    private suspend fun probeAndPrune() {
+        val watching = marketCache.result.watching
+        LogRepository.info(
+            "main",
+            "Waiting for all tickers to receive initial depth snapshot " +
+                "(dead-book probe: up to ${PROBE_DEADLINE_MS / 1000}s for snapshots, " +
+                "${PROBE_WINDOW_MS / 1000}s of book updates) ..."
+        )
+        val deadline = System.currentTimeMillis() + PROBE_DEADLINE_MS
+        while (depthCache.syncedTickers() < watching.size &&
+            System.currentTimeMillis() < deadline && !stopRequested
+        ) {
+            delay(500)
+        }
+        delay(PROBE_WINDOW_MS)
+        if (stopRequested) return
+
+        // A snapshot can fail transiently - a rate-limited second or a network
+        // hiccup. A ticker that never synced gets one retry round before it can
+        // be called dead, so a bad REST moment cannot permanently drop a live
+        // book from the universe.
+        val neverSynced = watching.filter { !depthCache.isSynced(it) }
+        if (neverSynced.isNotEmpty()) {
+            LogRepository.info(
+                "universe",
+                "Dead-book probe: ${neverSynced.size} tickers never received a snapshot; retrying once before exclusion"
+            )
+            neverSynced.chunked(50).forEach { batch ->
+                batch.forEach { sym -> wsClient?.requestSnapshot(sym) }
+                delay(200)
+            }
+            delay(5_000)
+            if (stopRequested) return
+        }
+
+        val dead = depthCache.getTickersWithoutRecentUpdate(PROBE_WINDOW_MS).toSet()
+        if (dead.isEmpty()) {
+            LogRepository.info(
+                "universe",
+                "Dead-book probe: every one of ${watching.size} tickers produced a book update; universe unchanged"
+            )
+            return
+        }
+        val sorted = dead.sorted()
+        val sample = sorted.take(40).joinToString(",") + if (sorted.size > 40) ", ..." else ""
+        LogRepository.warn(
+            "universe",
+            "Dead-book probe: ${dead.size} of ${watching.size} tickers produced no update in " +
+                "${PROBE_WINDOW_MS / 1000}s; excluding permanently for this session: [$sample]"
+        )
+        rebuildUniverse(dead)
+    }
+
+    /**
+     * Rebuilds the entire universe with [deadTickers] excluded.
+     *
+     * This is the "never revisited" half of the dead-book filter: the excluded
+     * books are dropped from the triangle universe, from the related-trade
+     * indexes, from the depth cache, and from the websocket subscription - so
+     * no later cycle can spend work on them and nothing can re-add them this
+     * session. A new session re-probes from scratch.
+     */
+    private suspend fun rebuildUniverse(deadTickers: Set<String>) {
+        val keptSymbols = exchangeSymbols.filter { it.symbol !in deadTickers }
+        marketCache.initialize(keptSymbols, emptySet())
+        val result = marketCache.result
+
+        depthCache.pruneTo(result.watching)
+        PaperTradingEngine.paperUniverse.clear()
+        for ((ticker, info) in result.tradingSymbols) {
+            PaperTradingEngine.paperUniverse[ticker] = info.baseAsset to info.quoteAsset
+        }
+
+        // Re-subscribe to the surviving set only: the dead books are gone from
+        // the feed, not merely ignored by the scanner.
+        val validDepth = BinanceWebSocketClient.resolveValidDepth(ExecutionConfig.scanningDepth)
+        wsClient?.close()
+        wsClient = BinanceWebSocketClient(http, depthCache, validDepth)
+        wsClient!!.onResync = feedResyncHandler
+        statusJob?.cancel()
+        statusJob = scope.launch {
+            wsClient?.status?.collect { s ->
+                _connection.value = _connection.value.copy(wsStatus = s.name)
+            }
+        }
+        wsCountJob?.cancel()
+        wsCountJob = scope.launch {
+            wsClient?.messagesReceived?.collect { _wsMessages.value = it }
+        }
+        _connection.value = _connection.value.copy(
+            totalTickers = result.watching.size,
+            syncedTickers = depthCache.syncedTickers()
+        )
+        LogRepository.info(
+            "binance",
+            "Re-subscribing depth websocket for ${result.watching.size} surviving tickers ..."
+        )
+        wsClient!!.connect(result.watching)
+        result.watching.chunked(50).forEach { batch ->
+            batch.forEach { sym -> wsClient!!.requestSnapshot(sym) }
+            delay(200)
+        }
+        if (stopRequested) {
+            wsClient?.close()
+            return
+        }
+
+        LogRepository.info(
+            "universe",
+            "Universe rebuilt: ${result.trades.size} triangles across ${result.bases.size} base assets " +
+                "(largest: ${result.referenceBase}); watching ${result.watching.size} tickers"
+        )
+        refreshFeedHealth()
+    }
+
+    /**
+     * Reference pair for an asset: its USDT pair when one exists, otherwise any
+     * live pair it takes part in. Used for sizing and lot grids, never as a
+     * restriction on the universe.
+     */
+    private fun referenceSymbolInfo(asset: String): SymbolInfo? {
+        val trading = marketCache.result.tradingSymbols
+        trading[asset + "USDT"]?.let { return it }
+        trading.values.firstOrNull { it.baseAsset == asset }?.let { return it }
+        return trading.values.firstOrNull { it.quoteAsset == asset }
+    }
+
+    /**
+     * Populates [InvestmentSpec.DEFAULTS] for every base asset the discovered
+     * universe roots a triangle at, each sized to [perTradeUsdt] at that
+     * asset's own USDT price.
+     *
+     * In AUTO investment mode every spec is re-derived here. In MANUAL mode the
+     * operator's configured base is left verbatim and only the bases that have
+     * no configured spec are filled in - without them, [CalculationNode.optimize]
+     * would throw for every triangle rooted outside the configured asset.
+     */
+    private fun seedInvestmentSpecs(perTradeUsdt: Double) {
+        if (marketCache.result.bases.isEmpty()) return
+        val prices = usdtValues()
+        val lots = lotFilters()
+        var unpriceable = 0
+        for (base in marketCache.result.bases) {
+            if (!ExecutionConfig.investmentAuto && base in InvestmentSpec.DEFAULTS) continue
+            val lot = lots[base]
+            val (min, max, step) = AutoTuner.deriveInvestment(
+                base, perTradeUsdt, prices[base] ?: 0.0,
+                lot?.first ?: 0.0, lot?.second ?: 0.0
+            )
+            if (prices[base] == null) unpriceable++
+            InvestmentSpec.DEFAULTS[base] = InvestmentSpec(base, min, max, step)
+        }
+        if (unpriceable > 0) {
+            LogRepository.debug(
+                "settings",
+                "Sizing fallback for $unpriceable base assets with no USDT-reachable price " +
+                    "(sized at minimum lot; refreshed as books arrive)"
+            )
+        }
+    }
+
+    /**
+     * USDT value of every asset, resolved from live book mid prices by
+     * relaxation over the pair graph: USDT is 1 by definition, a direct USDT
+     * pair prices its other side, and each further pass prices assets through
+     * the ones already valued. No asset names are hard-coded, and an asset the
+     * graph cannot reach is simply absent (it cannot be sized, so it gets no
+     * investment spec and no triangles are traded from it).
+     */
+    private fun usdtValues(): Map<String, Double> {
+        val legsByAsset = HashMap<String, MutableList<SymbolInfo>>()
+        for (sym in marketCache.result.tradingSymbols.values) {
+            legsByAsset.getOrPut(sym.baseAsset) { ArrayList() }.add(sym)
+            if (sym.quoteAsset != sym.baseAsset) {
+                legsByAsset.getOrPut(sym.quoteAsset) { ArrayList() }.add(sym)
+            }
+        }
+        val prices = HashMap<String, Double>()
+        prices["USDT"] = 1.0
+        repeat(3) {
+            for ((asset, legs) in legsByAsset) {
+                if (asset in prices) continue
+                for (sym in legs) {
+                    val other = if (asset == sym.baseAsset) sym.quoteAsset else sym.baseAsset
+                    val otherPrice = prices[other] ?: continue
+                    val mid = depthCache.getSortedSnapshot(sym.symbol, 5)?.let { midPrice(it) } ?: continue
+                    if (mid <= 0.0) continue
+                    prices[asset] = if (asset == sym.baseAsset) mid * otherPrice else otherPrice / mid
+                    break
+                }
+            }
+        }
+        return prices
+    }
+
+    /**
+     * LOT_SIZE grid per base asset, preferred from its stable-quoted pairs.
+     * The grid constrains investment quantities, so it must belong to a ticker
+     * where the asset is the base; an asset that is only ever a quote falls
+     * back to the generic step in [AutoTuner.deriveInvestment].
+     */
+    private fun lotFilters(): Map<String, Pair<Double, Double>> {
+        val map = HashMap<String, Pair<Double, Double>>()
+        val trading = marketCache.result.tradingSymbols.values
+        for (quote in listOf("USDT", "USDC", "FDUSD")) {
+            for (sym in trading) {
+                if (sym.quoteAsset == quote) {
+                    map.putIfAbsent(sym.baseAsset, (sym.lotStep ?: 0.0) to (sym.lotMinQty ?: 0.0))
+                }
+            }
+        }
+        for (sym in trading) {
+            map.putIfAbsent(sym.baseAsset, (sym.lotStep ?: 0.0) to (sym.lotMinQty ?: 0.0))
+        }
+        return map
     }
 
     private fun defaultPaperBalance(bases: Set<String>): Map<String, Double> = buildMap {
@@ -936,24 +1216,9 @@ class ScannerController(
             ExecutionConfig.imbalanceAuto || ExecutionConfig.cadenceAuto ||
             ExecutionConfig.maxArmedAuto || ExecutionConfig.paperLatencyAuto ||
             ExecutionConfig.paperSlippageAuto
-        if (!anyAuto) {
-            _autoTuneInfo.value = "all settings MANUAL"
-            return
-        }
-        val base = InvestmentSpec.DEFAULTS.keys.firstOrNull() ?: return
-        val quote = "USDT"
-        val pair = base + quote
-        val info = marketCache.result.tradingSymbols[pair]
-
-        val snapshot = depthCache.getSortedSnapshot(pair, AutoTuner.VALID_DEPTHS.last())
-        val price = snapshot?.let { midPrice(it) } ?: 0.0
-        // Measured across the universe, low percentile: the depth has to serve
-        // the THINNEST book we scan, not the base pair. Sizing it on BTCUSDT -
-        // a book so deep that one level covers everything - is what left the
-        // alt books unable to cover a single leg.
-        val levelNotional = thinnestBookLevelNotional()
-
-        // Kelly f* for the opportunity currently at the top of the book.
+        // Kelly f* for the opportunity currently at the top of the book. Kept
+        // ahead of the MANUAL early-return because per-base sizing needs the
+        // same per-trade notional the tuner derives.
         val bestPercent = _currentOpportunity.value?.percent ?: 0.0
         val sigma = kellyTrader?.sigma() ?: KellyConfig.defaultSigmaPercent
         val kellyFraction = if (KellyConfig.enabled && bestPercent > 0.0 && sigma > 0.0) {
@@ -967,10 +1232,42 @@ class ScannerController(
             0.0
         }
 
+        if (!anyAuto) {
+            // Every knob is operator-owned, but per-base sizing is still
+            // load-bearing: optimize() sweeps the spec of each trade's root
+            // asset, and roots come from the market rather than Settings. The
+            // configured base keeps its verbatim numbers; the rest of the
+            // discovered universe gets mechanical sizing so the scan can run.
+            seedInvestmentSpecs(
+                AutoTuner.derivePerTradeUsdt(
+                    KellyConfig.budgetUsdt, kellyFraction, KellyConfig.maxAllocationPerTrade,
+                    KellyConfig.investmentFractionOfKelly, KellyConfig.minTradeUsdt
+                )
+            )
+            _autoTuneInfo.value = "all settings MANUAL"
+            return
+        }
+        // Reference book: the base with the most triangles - the deepest, most
+        // liquid market in the discovered universe. Representative only; the
+        // per-base specs below already cover every base individually.
+        val base = marketCache.result.referenceBase
+            ?: InvestmentSpec.DEFAULTS.keys.firstOrNull()
+            ?: return
+        val info = referenceSymbolInfo(base)
+        val pair = info?.symbol ?: (base + "USDT")
+
+        val snapshot = depthCache.getSortedSnapshot(pair, AutoTuner.VALID_DEPTHS.last())
+        val price = snapshot?.let { midPrice(it) } ?: 0.0
+        // Measured across the universe, low percentile: the depth has to serve
+        // the THINNEST book we scan, not the base pair. Sizing it on BTCUSDT -
+        // a book so deep that one level covers everything - is what left the
+        // alt books unable to cover a single leg.
+        val levelNotional = thinnestBookLevelNotional()
+
         val result = AutoTuner.tune(
             AutoTuner.Inputs(
                 base = base,
-                quote = quote,
+                quote = info?.quoteAsset ?: "USDT",
                 budgetUsdt = KellyConfig.budgetUsdt,
                 basePriceUsdt = price,
                 lotStep = info?.lotStep ?: 0.0,
@@ -993,7 +1290,11 @@ class ScannerController(
             )
         )
 
-        if (ExecutionConfig.investmentAuto) InvestmentSpec.DEFAULTS[base] = result.investmentSpec()
+        // Per-base sizing: every base asset in the discovered universe gets a
+        // spec sized to the same per-trade notional at its own USDT price. This
+        // is what makes an all-asset universe runnable - the roots are no
+        // longer fixed, so no single configured spec can cover them.
+        seedInvestmentSpecs(result.perTradeUsdt)
         if (ExecutionConfig.feeAuto) ExecutionConfig.feePercent = result.feePercent
         if (ExecutionConfig.profitThresholdAuto) ExecutionConfig.profitThreshold = result.profitThreshold
         if (ExecutionConfig.capAuto) ExecutionConfig.cap = result.cap
@@ -1498,6 +1799,7 @@ class ScannerController(
     }
 
     fun stop() {
+        stopRequested = true
         updateJob?.cancel()
         latencyJob?.cancel()
         bnbWatchdog?.cancel()

@@ -19,7 +19,19 @@ class MarketCache(
         val relatedTrades: Map<String, List<Trade>>,
         val relatedTickers: Map<String, Set<String>>,
         val tradingSymbolCount: Int,
-        val totalSymbolCountFound: Int
+        val totalSymbolCountFound: Int,
+        /**
+         * Assets that a discovered round trip starts and ends in. Derived from
+         * the live pair graph, never from configuration: every asset that can
+         * root a triangle appears here, so sizing can be derived per asset.
+         */
+        val bases: Set<String> = emptySet(),
+        /**
+         * The base asset with the most triangles. Used as the reference asset
+         * for tuner readings that need one representative book (fee tier,
+         * latency, depth sampling) - not as a restriction on the universe.
+         */
+        val referenceBase: String? = null
     )
 
     var result: Result = Result(emptyMap(), emptyList(), emptyList(), emptyMap(), emptyMap(), 0, 0)
@@ -40,7 +52,16 @@ class MarketCache(
     /**
      * Port of MarketCache.initialize(): parses exchangeInfo symbols, keeps only
      * `TRADING` symbols, computes dustDecimals from LOT_SIZE.minQty, then
-     * discovers triangles for every configured investment base.
+     * discovers triangles over the live pair graph.
+     *
+     * Discovery is graph-based rather than brute force. Each trading pair is an
+     * edge between its two assets; a triangle exists exactly where three assets
+     * are mutually connected. Enumerating mutual neighbours costs O(V*E) and
+     * finds every round trip in the market, where the original triple loop cost
+     * O(bases * V^2) and could only ever find triangles that started and ended
+     * in a configured base - which is why every opportunity it reported began
+     * with BTC. [investmentBases] is therefore no longer a universe: it is an
+     * optional restriction (empty means every asset the exchange lists).
      *
      * Both traversal directions of a triangle are kept by default. They are
      * NOT the same trade: A->B->C->A crosses one side of each book and
@@ -56,42 +77,57 @@ class MarketCache(
      */
     fun initialize(
         symbols: List<SymbolInfo>,
-        investmentBases: Set<String>
+        investmentBases: Set<String> = emptySet()
     ): Result {
         val trading = symbols.filter { it.isTrading }
         val tradingSymbols = HashMap<String, SymbolInfo>(trading.size)
-        val uniqueSymbols = LinkedHashSet<String>()
 
         for (symbolObj in trading) {
-            uniqueSymbols.add(symbolObj.baseAsset)
-            uniqueSymbols.add(symbolObj.quoteAsset)
             val lotSize = symbolObj.filters.firstOrNull { it.filterType == "LOT_SIZE" }
             val minQty = lotSize?.minQty ?: "1"
             val dustDecimals = maxOf(minQty.indexOf('1') - 1, 0)
             tradingSymbols[symbolObj.symbol] = symbolObj.copy(dustDecimals = dustDecimals)
         }
 
+        // Adjacency: asset -> every asset it shares a live pair with. Sorted so
+        // the enumeration (and therefore the trade list) is deterministic.
+        val adjacency = HashMap<String, java.util.TreeSet<String>>()
+        for (symbolObj in tradingSymbols.values) {
+            adjacency.getOrPut(symbolObj.baseAsset) { java.util.TreeSet() }
+                .add(symbolObj.quoteAsset)
+            adjacency.getOrPut(symbolObj.quoteAsset) { java.util.TreeSet() }
+                .add(symbolObj.baseAsset)
+        }
+
+        // Empty restriction = every asset on the exchange. Only an explicit
+        // non-empty set narrows the universe.
+        val roots: Collection<String> =
+            if (investmentBases.isEmpty()) adjacency.keys.sorted() else investmentBases
+
         val trades = ArrayList<Trade>()
         var skippedMirrors = 0
-        for (symbol1 in investmentBases) {
-            for (symbol2 in uniqueSymbols) {
-                for (symbol3 in uniqueSymbols) {
+        for (a in roots) {
+            val aNeighbours = adjacency[a] ?: continue
+            for (b in aNeighbours) {
+                val bNeighbours = adjacency[b] ?: continue
+                for (c in bNeighbours) {
+                    if (c == a || c == b) continue
+                    // Mutual connection is what makes a triangle: without the
+                    // c-a pair this is a path, not a round trip.
+                    if (c !in aNeighbours) continue
                     // De-duplication is opt-in and default-off: the mirror
                     // trades the opposite side of the same books, so dropping
                     // it drops real opportunities. See the class comment.
-                    if (ExecutionConfig.dedupeMirroredTriangles) {
-                        if (symbol2 == symbol3) continue
-                        if (symbol2 > symbol3) {
-                            // The mirror (symbol1-symbol3-symbol2) was already
-                            // considered; count it only when it is a real
-                            // triangle, so the number is exact.
-                            if (createTrade(tradingSymbols, symbol1, symbol3, symbol2) != null) {
-                                skippedMirrors++
-                            }
-                            continue
+                    if (ExecutionConfig.dedupeMirroredTriangles && b > c) {
+                        // The mirror (a-c-b) was already considered; count it
+                        // only when it is a real trade (whitelist and template
+                        // can still reject it), so the number stays exact.
+                        if (createTrade(tradingSymbols, a, c, b) != null) {
+                            skippedMirrors++
                         }
+                        continue
                     }
-                    createTrade(tradingSymbols, symbol1, symbol2, symbol3)?.let { trades.add(it) }
+                    createTrade(tradingSymbols, a, b, c)?.let { trades.add(it) }
                 }
             }
         }
@@ -113,6 +149,11 @@ class MarketCache(
             }
         }
 
+        val tradeBases = trades.mapTo(java.util.TreeSet()) { it.symbol.a }
+        val reference = tradeBases.maxByOrNull { base ->
+            trades.count { it.symbol.a == base }
+        }
+
         result = Result(
             tradingSymbols = tradingSymbols,
             trades = trades,
@@ -120,7 +161,9 @@ class MarketCache(
             relatedTrades = relatedTrades.mapValues { it.value.toList() },
             relatedTickers = relatedTickers.mapValues { it.value.toSet() },
             tradingSymbolCount = trading.size,
-            totalSymbolCountFound = symbols.size
+            totalSymbolCountFound = symbols.size,
+            bases = tradeBases,
+            referenceBase = reference
         )
         return result
     }
