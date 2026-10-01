@@ -34,6 +34,7 @@ import com.hakim3691.bta.log.LogRepository
 import com.hakim3691.bta.market.BinanceRestClient
 import com.hakim3691.bta.market.BinanceWebSocketClient
 import com.hakim3691.bta.market.DepthCacheManager
+import com.hakim3691.bta.market.RestDiagnosis
 import com.hakim3691.bta.market.WsStatus
 import com.hakim3691.bta.paper.PaperTradingEngine
 import com.hakim3691.bta.research.ArmEpisode
@@ -128,6 +129,14 @@ class ScannerController(
          * quiet-book tolerance for the same reason the probe window is.
          */
         const val STALE_TICKER_GRACE_MS = 120_000L
+
+        /**
+         * Startup latency probes are retried rather than fatal. A phone that
+         * is changing network, or a single lost packet on a congested mobile
+         * link, must not be indistinguishable from Binance being unreachable.
+         */
+        const val PING_ATTEMPTS = 3
+        const val PING_RETRY_DELAY_MS = 2_000L
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -536,10 +545,45 @@ class ScannerController(
             )
             restClient = rest
 
-            // SpeedTest.multiPing(5) equivalent + clock skew measurement
+            // SpeedTest.multiPing(5) equivalent + clock skew measurement.
+            // One failed probe must not end the session: a single dropped
+            // packet or a brief handover between wifi and mobile data used to
+            // abort startup outright, leaving the dashboard on ERROR with no
+            // way back except a manual restart. The scanner needs a WORKING
+            // probe to proceed, not a flawless one.
             val pings = mutableListOf<Long>()
-            repeat(5) { pings.add(rest.ping()) }
-            val avg = pings.average()
+            var lastProbeError: Exception? = null
+            var avg = 0.0
+            var probeOk = false
+            for (attempt in 1..PING_ATTEMPTS) {
+                try {
+                    pings.clear()
+                    repeat(5) { pings.add(rest.ping()) }
+                    avg = pings.average()
+                    probeOk = true
+                    break
+                } catch (e: Exception) {
+                    lastProbeError = e
+                    LogRepository.warn(
+                        "performance",
+                        "Latency probe attempt $attempt/$PING_ATTEMPTS failed: " +
+                            RestDiagnosis.describe(e)
+                    )
+                    if (attempt < PING_ATTEMPTS) delay(PING_RETRY_DELAY_MS)
+                }
+            }
+            if (!probeOk) {
+                // Unreachable is the honest state, and the reason is what the
+                // user needs - "REST DOWN" with no cause is unactionable.
+                val reason = RestDiagnosis.describe(lastProbeError!!)
+                _connection.value = _connection.value.copy(restOk = false, latencyMs = 0, lastError = reason)
+                _state.value = ScannerState.ERROR
+                LogRepository.error(
+                    "main",
+                    "Binance REST unreachable after $PING_ATTEMPTS attempts - " + reason
+                )
+                return
+            }
             LogRepository.info("performance", "Experiencing ${avg.toInt()} ms of latency")
 
             // Seed the self-tuning age threshold with observed latency
@@ -561,7 +605,13 @@ class ScannerController(
                         "signed requests use server time"
                 )
             }
-            _connection.value = _connection.value.copy(restOk = true, latencyMs = avg.toLong())
+            _connection.value = _connection.value.copy(
+                restOk = true,
+                latencyMs = avg.toLong(),
+                // A recovered session must not keep advertising the failure
+                // that has already been resolved.
+                lastError = null
+            )
 
             LogRepository.info("main", "Fetching exchange info ...")
             val symbols = rest.exchangeInfo()
@@ -779,10 +829,14 @@ class ScannerController(
             summaryOpportunities = 0
         } catch (e: Exception) {
             _state.value = ScannerState.ERROR
+            // The reason travels to the UI, not just the log: a scanner that
+            // stops at ERROR with every counter at zero tells the user nothing
+            // about whether the key, the region or the network is at fault.
+            val reason = RestDiagnosis.describe(e)
+            _connection.value = _connection.value.copy(lastError = reason)
             LogRepository.error(
                 "main",
-                "Initialization failed: " + e.javaClass.name + ": " + e.message +
-                    " | " + LogRepository.stackTrace(e)
+                "Initialization failed: " + reason + " | " + LogRepository.stackTrace(e)
             )
             return
         }
@@ -854,11 +908,13 @@ class ScannerController(
             )
             return
         }
+        var permsError: String? = null
         val perms = runCatching { rest.apiKeyRestrictions() }
             .onFailure {
+                permsError = RestDiagnosis.describe(it)
                 LogRepository.info(
                     "settings",
-                    "Key permission check unavailable: ${it.javaClass.simpleName}: ${it.message}"
+                    "Key permission check unavailable: $permsError"
                 )
             }
             .getOrNull()
@@ -868,7 +924,11 @@ class ScannerController(
             canRead = perms?.canRead,
             canSpotTrade = perms?.canTrade,
             feePercent = feePercent,
-            checkedAtMs = System.currentTimeMillis()
+            checkedAtMs = System.currentTimeMillis(),
+            // Why the checks could not complete. Without this the panel can
+            // only say "not checked", which reads like a key problem when the
+            // real cause is usually the network or Binance refusing the region.
+            problem = permsError
         )
         LogRepository.info(
             "settings",

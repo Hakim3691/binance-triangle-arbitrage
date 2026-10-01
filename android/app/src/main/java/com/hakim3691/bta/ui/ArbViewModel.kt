@@ -308,6 +308,8 @@ class ArbViewModel(
                 s.canSpotTrade == true -> "Key ${s.maskedKey}: read OK, spot trading enabled"
                 s.canSpotTrade == false ->
                     "Key ${s.maskedKey}: read OK, but spot trading is DISABLED - paper fees only"
+                // Name the real cause instead of "permission check unavailable".
+                s.problem != null -> "Key ${s.maskedKey}: ${s.problem}"
                 else -> "Key ${s.maskedKey}: stored; permission check unavailable"
             }
         }

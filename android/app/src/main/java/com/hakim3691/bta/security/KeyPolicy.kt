@@ -26,7 +26,16 @@ data class KeyStatus(
     val canSpotTrade: Boolean?,
     /** Effective account taker fee in percent, from /sapi/v1/asset/tradeFee. */
     val feePercent: Double?,
-    val checkedAtMs: Long
+    val checkedAtMs: Long,
+    /**
+     * Why the capability checks could not complete, in plain language.
+     *
+     * Null when they did complete (or when there is no key to check). This is
+     * what separates "the key is bad" from "Binance blocked this region" from
+     * "the phone has no internet" - three failures the panel used to render as
+     * the identical, useless "not checked".
+     */
+    val problem: String? = null
 )
 
 object KeyPolicy {

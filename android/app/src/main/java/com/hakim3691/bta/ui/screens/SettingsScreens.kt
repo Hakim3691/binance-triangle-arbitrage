@@ -582,6 +582,13 @@ private fun CredentialsPanel(viewModel: ArbViewModel) {
                     keyStatus.feePercent?.let { "%.4f%%".format(it) } ?: "fallback",
                     valueColor = if (keyStatus.feePercent != null) ProfitGreen else TextSecondary
                 )
+                // The checks above can only say "not checked". This line says
+                // WHY, which is the difference between fixing a wrong key and
+                // discovering that Binance is refusing the whole region.
+                keyStatus.problem?.let {
+                    Spacer(Modifier.height(6.dp))
+                    Text(it, color = LossRed, fontSize = 12.sp)
+                }
             } else {
                 Text(
                     "No key stored - paper mode runs on the default fee fallback. " +

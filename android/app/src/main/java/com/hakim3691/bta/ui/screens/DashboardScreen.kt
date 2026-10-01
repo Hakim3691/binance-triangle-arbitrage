@@ -275,6 +275,16 @@ fun DashboardScreen(viewModel: ArbViewModel, navController: NavController) {
             Spacer(Modifier.height(10.dp))
             Text("Last error: ${connection.lastError}", color = LossRed, fontSize = 12.sp)
         }
+
+        // A scanner sitting on ERROR with every counter at zero gave the user
+        // nothing to act on. Whatever stopped it is stated here, in full.
+        if (state == ScannerState.ERROR && connection.lastError != null) {
+            Spacer(Modifier.height(10.dp))
+            Text(
+                "Startup failed: ${connection.lastError}",
+                color = LossRed, fontSize = 12.sp
+            )
+        }
         Spacer(Modifier.height(24.dp))
     }
 }

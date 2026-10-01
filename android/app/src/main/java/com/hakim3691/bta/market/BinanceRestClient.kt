@@ -22,6 +22,76 @@ import javax.crypto.spec.SecretKeySpec
 /** Binance REST error carrying the API error code/message. */
 class BinanceApiException(val code: Int, message: String) : Exception(message)
 
+/**
+ * Turns a transport failure into something a user can act on.
+ *
+ * Every REST failure used to surface as the same opaque
+ * "[HTTP 451] Service unavailable from a restricted location..." or bare
+ * UnknownHostException, so the dashboard could only say ERROR and the
+ * credentials panel could only say "permission check unavailable" - with no
+ * way to tell a geo-blocked region from a dead Wi-Fi connection from a
+ * revoked API key. Those three have completely different fixes, and the one
+ * that bites hardest (HTTP 451, Binance refusing the whole jurisdiction) is
+ * invisible unless it is named.
+ */
+object RestDiagnosis {
+
+    /** Binance's jurisdiction refusal: the account/IP cannot use the API at all. */
+    const val GEO_BLOCKED = "GEO BLOCKED"
+
+    fun describe(t: Throwable): String {
+        val raw = (t.message ?: "").trim()
+        val lower = raw.lowercase()
+
+        // Binance answers a blocked region with HTTP 451 on EVERY endpoint,
+        // signed or not, before the key is ever evaluated.
+        if (t is BinanceApiException && t.code == 451) {
+            return "Binance blocked this network's region (HTTP 451). The API key " +
+                "cannot fix this - the device needs a connection from a country " +
+                "Binance serves, or a Binance.US account."
+        }
+        if (t is BinanceApiException && t.code == 401) {
+            return "Binance rejected the API key (HTTP 401). The key is invalid, " +
+                "expired, or wrong for this environment."
+        }
+        if (t is BinanceApiException && t.code == 429) {
+            return "Binance rate limit hit (HTTP 429). Too many requests; wait and retry."
+        }
+        if (t is BinanceApiException && (t.code == -1021 || lower.contains("-1021") || lower.contains("recvwindow"))) {
+            return "Device clock is out of sync with Binance (-1021). Enable " +
+                "automatic date/time on this device."
+        }
+        if (t is BinanceApiException && (t.code == -2015 || lower.contains("-2015"))) {
+            return "Binance rejected the API key (-2015). Check the key and secret, " +
+                "and that they were copied in full."
+        }
+        if (t is BinanceApiException) {
+            // The code is Binance's own here, not an HTTP status, so it is
+            // labelled as such rather than as a status line.
+            return "Binance error ${t.code}: ${raw.take(160)}"
+        }
+
+        // No HTTP response was received at all: this is the device, not Binance.
+        if (t is java.net.UnknownHostException) {
+            return "Cannot resolve api.binance.com - no working internet connection."
+        }
+        if (t is java.net.SocketTimeoutException) {
+            return "Timed out reaching Binance - the connection is too slow or offline."
+        }
+        if (t is java.net.ConnectException) {
+            return "Connection to Binance refused - check the network or VPN."
+        }
+        if (t is javax.net.ssl.SSLException) {
+            return "TLS handshake with Binance failed - a proxy or firewall is " +
+                "inspecting the connection, or the system date is wrong."
+        }
+        if (t is java.io.IOException) {
+            return "Network failure reaching Binance: ${raw.take(160)}"
+        }
+        return "${t.javaClass.simpleName}: ${raw.take(160)}"
+    }
+}
+
 /** Simple token-bucket style rate limiter for REST weight budgeting. */
 class RateLimiter(private val maxWeightPerMinute: Int = 6000) {
     private val windowStart = AtomicLong(System.currentTimeMillis())
@@ -414,10 +484,15 @@ class BinanceRestClient(
         http.newCall(req).execute().use { resp ->
             val bodyText = resp.body?.string() ?: ""
             if (!resp.isSuccessful) {
-                val msg = runCatching {
-                    json.parseToJsonElement(bodyText).jsonObject["msg"]?.jsonPrimitive?.content
-                }.getOrNull() ?: bodyText.take(200)
-                throw BinanceApiException(resp.code, "[HTTP ${resp.code}] $msg")
+                // Binance puts its own diagnostic code in the body (-1021 for a
+                // clock that drifted, -2015 for a rejected key). Passing the
+                // HTTP status instead collapsed every signed-request failure
+                // onto 400/401 and threw away the one number that identifies it.
+                val parsed = runCatching { json.parseToJsonElement(bodyText).jsonObject }.getOrNull()
+                val bodyCode = parsed?.get("code")?.jsonPrimitive?.content?.toIntOrNull()
+                val msg = parsed?.get("msg")?.jsonPrimitive?.content ?: bodyText.take(200)
+                val code = bodyCode ?: resp.code
+                throw BinanceApiException(code, "[HTTP ${resp.code}] $msg")
             }
             parse(bodyText)
         }
