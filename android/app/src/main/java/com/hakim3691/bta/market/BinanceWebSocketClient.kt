@@ -296,18 +296,29 @@ class BinanceWebSocketClient(
         }
     }
 
+    /**
+     * One unsigned client for every snapshot this client requests, created once.
+     *
+     * A fresh BinanceRestClient per symbol meant a fresh RateLimiter per symbol,
+     * so the 1198-ticker startup seeded itself with 1198 independent weight
+     * budgets and issued the whole universe at once into OkHttp's default of
+     * five concurrent connections per host. The startup probe then waited out
+     * its full 60s deadline with a fraction of the books seeded, reported the
+     * rest as dead, and rebuilt the universe around a feed that had simply
+     * never been given the time to arrive. Sharing the client shares the
+     * limiter, so the budget is the exchange's real budget again.
+     */
+    private val snapshotRest: BinanceRestClient by lazy {
+        BinanceRestClient(http, { "" }, { "" })
+    }
+
     fun requestSnapshot(symbol: String): Job {
         return scope.launch {
             try {
-                val rest = BinanceRestClient(
-                    http,
-                    { "" },
-                    { "" }
-                )
-                val d = rest.depth(symbol, snapshotLimit)
+                val d = snapshotRest.depth(symbol, snapshotLimit)
                 depthCache.applySnapshot(symbol, d.lastUpdateId, d.bids, d.asks)
             } catch (e: Exception) {
-                _lastError.value = "snapshot failed for $symbol: ${e.message}"
+                _lastError.value = "snapshot failed for $symbol: ${RestDiagnosis.describe(e)}"
                 // Retry on the next watchdog cycle
                 depthCache.markOutOfSync(symbol)
             }

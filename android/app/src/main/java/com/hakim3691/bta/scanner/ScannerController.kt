@@ -137,13 +137,45 @@ class ScannerController(
          */
         const val PING_ATTEMPTS = 3
         const val PING_RETRY_DELAY_MS = 2_000L
+
+        /**
+         * How often the startup probe reports how many books have been seeded.
+         * The wait it covers is up to 105s of genuine silence otherwise.
+         */
+        const val PROBE_PROGRESS_LOG_MS = 5_000L
+
+        /**
+         * Pair the account fee is read for. One liquid pair is enough: Binance
+         * charges spot commission per account, not per market, and naming it
+         * makes the "no row for X" log line say which pair it meant.
+         */
+        const val TRADE_FEE_SYMBOL = "BTCUSDT"
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    /**
+     * Shared HTTP client, with the per-host connection cap raised.
+     *
+     * OkHttp defaults to five concurrent requests per host. Startup seeds one
+     * REST snapshot per ticker in the universe - 1198 of them on the largest
+     * configurations - and at five at a time they could not finish inside the
+     * 60s snapshot deadline at anything like a 325ms round trip. The books
+     * were not dead; they had not been fetched yet, and the probe that was
+     * supposed to remove dead books removed live ones instead. Twelve keeps the
+     * exchange's weight budget as the binding constraint (the shared
+     * RateLimiter), rather than an arbitrary socket count.
+     */
     private val http = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(10, TimeUnit.SECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
+        .dispatcher(
+            okhttp3.Dispatcher().apply {
+                maxRequests = 64
+                maxRequestsPerHost = 12
+            }
+        )
         .build()
 
     private val depthCache = DepthCacheManager()
@@ -854,11 +886,17 @@ class ScannerController(
      */
     private suspend fun fetchRealFeeRate(rest: BinanceRestClient): Double? {
         return try {
-            val rate = rest.accountTakerCommission()
+            val rate = rest.accountTakerCommission(TRADE_FEE_SYMBOL)
             if (rate == null) {
+                // Only true when there is no key at all, or Binance answered
+                // successfully with no row for the pair. A refusal now throws and
+                // is reported by the catch below with its real cause, so this
+                // line no longer claims "no API key" while the permissions
+                // check two lines later says the key works.
                 LogRepository.info(
                     "settings",
-                    "Fee rate: no API key or no tradeFee row; keeping ${ExecutionConfig.feePercent}% fallback"
+                    "Fee rate: tradeFee returned no row for ${TRADE_FEE_SYMBOL}; " +
+                        "keeping ${ExecutionConfig.feePercent}% fallback"
                 )
                 return null
             }
@@ -887,7 +925,7 @@ class ScannerController(
         } catch (e: Exception) {
             LogRepository.info(
                 "settings",
-                "Fee rate unavailable: ${e.javaClass.simpleName}: ${e.message}; keeping " +
+                "Fee rate unavailable: ${RestDiagnosis.describe(e)}; keeping " +
                     "${ExecutionConfig.feePercent}% fallback"
             )
             null
@@ -942,7 +980,7 @@ class ScannerController(
      * live trading. Runs on a read-only client: verification can never place
      * an order, whatever mode the scanner is in.
      */
-    suspend fun verifyKeyNow() {
+    suspend fun verifyKeyNow() = withContext(Dispatchers.IO) {
         val (apiKey, apiSecret) = runCatching { credentialProvider() }.getOrDefault("" to "")
         if (apiKey.isBlank()) {
             _keyStatus.value = KeyStatus(
@@ -953,7 +991,7 @@ class ScannerController(
                 "settings",
                 "No Binance key stored - paper mode continues without account fees"
             )
-            return
+            return@withContext
         }
         val rest = BinanceRestClient(http, { apiKey }, { apiSecret }, writeAccess = { false })
         val feePercent = fetchRealFeeRate(rest)
@@ -1045,13 +1083,53 @@ class ScannerController(
                 "${PROBE_WINDOW_MS / 1000}s of book updates) ..."
         )
         val deadline = System.currentTimeMillis() + PROBE_DEADLINE_MS
+        var lastProgressAt = 0L
         while (depthCache.syncedTickers() < watching.size &&
             System.currentTimeMillis() < deadline && !stopRequested
         ) {
             delay(500)
+            // Progress, every few seconds. This wait used to be completely
+            // silent for up to 105s, so a session that was simply fetching
+            // 1198 books looked identical to one that had hung: the log went
+            // straight from "Waiting for all tickers" to "Scanner stopped"
+            // with nothing in between, which is exactly the evidence needed to
+            // tell a slow feed from a dead one.
+            val now = System.currentTimeMillis()
+            if (now - lastProgressAt >= PROBE_PROGRESS_LOG_MS) {
+                lastProgressAt = now
+                LogRepository.info(
+                    "universe",
+                    "Initial snapshots: ${depthCache.syncedTickers()}/${watching.size} seeded, " +
+                        "${(deadline - now) / 1000}s left on the snapshot deadline"
+                )
+            }
+        }
+        if (stopRequested) {
+            LogRepository.warn(
+                "universe",
+                "Dead-book probe aborted: stop requested with " +
+                    "${depthCache.syncedTickers()}/${watching.size} snapshots seeded - " +
+                    "the feed was NOT evaluated, so no books were excluded"
+            )
+            return
+        }
+        val seeded = depthCache.syncedTickers()
+        if (seeded < watching.size) {
+            LogRepository.warn(
+                "universe",
+                "Snapshot deadline reached with only $seeded/${watching.size} books seeded; " +
+                    "proceeding with what arrived"
+            )
         }
         delay(PROBE_WINDOW_MS)
-        if (stopRequested) return
+        if (stopRequested) {
+            LogRepository.warn(
+                "universe",
+                "Dead-book probe aborted during the ${PROBE_WINDOW_MS / 1000}s book-update " +
+                    "window - the feed was NOT evaluated, so no books were excluded"
+            )
+            return
+        }
 
         // A snapshot can fail transiently - a rate-limited second or a network
         // hiccup. A ticker that never synced gets one retry round before it can
@@ -1068,7 +1146,13 @@ class ScannerController(
                 delay(200)
             }
             delay(5_000)
-            if (stopRequested) return
+            if (stopRequested) {
+                LogRepository.warn(
+                    "universe",
+                    "Dead-book probe aborted during the retry round - no books were excluded"
+                )
+                return
+            }
         }
 
         val dead = depthCache.getTickersWithoutRecentUpdate(PROBE_WINDOW_MS).toSet()

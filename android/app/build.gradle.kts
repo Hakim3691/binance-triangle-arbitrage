@@ -6,21 +6,44 @@ plugins {
 }
 
 /**
- * True only when this Gradle root is the top level of a git repository, i.e. the
- * checkout that actually owns these sources. False when git is missing, when the
- * build runs from an exported source tree, or when the project merely sits inside
- * some other repository - all cases where the surrounding repo's history says
- * nothing about this code.
+ * True when the git repository found above this directory actually tracks these
+ * Android sources.
+ *
+ * The original check demanded `git rev-parse --show-toplevel == rootDir`, i.e.
+ * that android/ be the top level of its own checkout. It never is for the real
+ * workflow: the port lives at `android/` inside the Node.js repository, so the
+ * toplevel is the repository root and the check was always false. Every APK
+ * therefore shipped `Commit: unknown` on the Connection screen, which is the
+ * one field that answers "which build am I actually running?" - and it was
+ * blank precisely when provenance mattered most.
+ *
+ * What actually matters is not where the repository root is but whether it
+ * tracks THIS code. `git ls-files` on our own build file answers that: it
+ * succeeds in the real checkout (android/ is tracked on feature/android-port)
+ * and fails in an exported tree dropped inside an unrelated repository, which
+ * is the case the check was meant to catch.
  */
-val isOwnGitCheckout: Boolean = run {
+val trackedInGitRepo: Boolean = run {
     val topLevel = providers.exec {
         commandLine("git", "rev-parse", "--show-toplevel")
         isIgnoreExitValue = true
     }.standardOutput.asText.get().trim()
-    topLevel.isNotEmpty() && topLevel == rootDir.canonicalPath
+    if (topLevel.isEmpty()) {
+        false
+    } else {
+        // providers.exec runs in the build script's own directory (android/app),
+        // so the probe has to run from the Gradle root, where
+        // `app/build.gradle.kts` is a real tracked path.
+        val tracked = providers.exec {
+            workingDir(rootDir)
+            commandLine("git", "ls-files", "--error-unmatch", "app/build.gradle.kts")
+            isIgnoreExitValue = true
+        }
+        tracked.result.get().exitValue == 0
+    }
 }
 
-val gitShortSha: String = if (isOwnGitCheckout) {
+val gitShortSha: String = if (trackedInGitRepo) {
     providers.exec { commandLine("git", "rev-parse", "--short", "HEAD") }
         .standardOutput.asText.get().trim()
 } else "unknown"

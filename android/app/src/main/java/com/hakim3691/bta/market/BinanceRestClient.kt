@@ -156,7 +156,19 @@ class BinanceRestClient(
      * before any order request is built, so a paper session cannot place a real
      * order even through a code path bug.
      */
-    private val writeAccess: () -> Boolean = { true }
+    private val writeAccess: () -> Boolean = { true },
+    /**
+     * REST weight budget for this client.
+     *
+     * Injected rather than always constructed internally for one reason: the
+     * startup seeder requests one depth snapshot per ticker in the universe -
+     * over a thousand of them inside a 60s deadline - and that burst is only
+     * respectable against ONE shared budget. A per-request limiter (the
+     * default arrangement, since every call site built its own client) enforces
+     * the exchange's per-minute limit once per request, which is no limit at
+     * all, and lets the burst run until the exchange refuses it.
+     */
+    private val rateLimiter: RateLimiter = RateLimiter()
 ) {
 
     private val json = Json { ignoreUnknownKeys = true }
@@ -484,19 +496,42 @@ class BinanceRestClient(
         return ioCall {
             http.newCall(request).execute().use { resp ->
                 val bodyText = resp.body?.string() ?: return@use null
-                if (!resp.isSuccessful) return@use null
-                val obj = runCatching { json.parseToJsonElement(bodyText).jsonObject }.getOrNull()
-                    ?: return@use null
-                val rows = obj["tradeFee"]?.jsonArray ?: return@use null
-                for (row in rows) {
-                    val ro = row.jsonObject
-                    if (ro["symbol"]?.jsonPrimitive?.content == symbol) {
-                        return@use ro["takerCommission"]?.jsonPrimitive?.content?.toDoubleOrNull()
-                    }
+                if (!resp.isSuccessful) {
+                    // Returning a bare null here is what made this endpoint
+                    // undiagnosable: a valid key whose permissions check passed
+                    // still logged "no API key or no tradeFee row", which is
+                    // false on both counts. Binance's own reason - a rejected
+                    // key, a missing spot-trading permission, a region block -
+                    // is now carried out as an exception the caller classifies.
+                    val parsed = runCatching { json.parseToJsonElement(bodyText).jsonObject }.getOrNull()
+                    val bodyCode = parsed?.get("code")?.jsonPrimitive?.content?.toIntOrNull()
+                    val msg = parsed?.get("msg")?.jsonPrimitive?.content ?: bodyText.take(200)
+                    throw BinanceApiException(bodyCode ?: resp.code, "[HTTP ${resp.code}] $msg")
                 }
-                null
+                parseTradeFee(bodyText, symbol)
             }
         }
+    }
+
+    /**
+     * The taker commission for [symbol] out of a `/sapi/v1/asset/tradeFee` body.
+     *
+     * Split out as a pure function so it can be tested without a server, and so
+     * the "no row" case is a deliberate parse result rather than a silent null:
+     * the caller logs a distinct line for it, which is what distinguishes "the
+     * key is fine, this account just has no row for that pair" from "Binance
+     * refused the request and we swallowed the reason".
+     */
+    internal fun parseTradeFee(bodyText: String, symbol: String): Double? {
+        val obj = runCatching { json.parseToJsonElement(bodyText).jsonObject }.getOrNull() ?: return null
+        val rows = obj["tradeFee"]?.jsonArray ?: return null
+        for (row in rows) {
+            val ro = row.jsonObject
+            if (ro["symbol"]?.jsonPrimitive?.content == symbol) {
+                return ro["takerCommission"]?.jsonPrimitive?.content?.toDoubleOrNull()
+            }
+        }
+        return null
     }
 
     // ------------------------------------------------------------------
@@ -531,6 +566,4 @@ class BinanceRestClient(
             parse(bodyText)
         }
     }
-
-    private val rateLimiter = RateLimiter()
 }
